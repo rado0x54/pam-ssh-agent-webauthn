@@ -1,6 +1,6 @@
 [package]
 name = "pam-ssh-agent-webauthn"
-version = "0.0.2"
+version = "0.1.0"
 edition = "2021"
 description = "PAM module for WebAuthn passkey-protected sudo via SSH agent forwarding"
 license = "MIT"
