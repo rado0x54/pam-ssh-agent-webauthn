@@ -1,43 +1,156 @@
 name: Release
 
+# Manually triggered. Enter the version (e.g. `0.0.3`) and the workflow will:
+#   1. validate the version is well-formed and greater than the current Cargo.toml version
+#   2. bump Cargo.toml + Cargo.lock to that version on main
+#   3. prepend a CHANGELOG.md section generated from `git log <prev>..HEAD`
+#   4. run clippy + test on the bumped tree (pre-flight gate)
+#   5. commit `chore: release vX.Y.Z`, tag `vX.Y.Z` on that commit, push main + tag
+#   6. build amd64 + arm64 .so artifacts against the tagged commit
+#   7. create the GitHub release with binaries, checksums, and source archives
+#
+# Pushes use GITHUB_TOKEN so they don't recurse into this workflow. The tag is
+# created fresh on the bump commit — never moved.
 on:
-  push:
-    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release (e.g. 0.0.3 — no v prefix)"
+        required: true
+        type: string
 
 permissions:
   contents: write
 
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 jobs:
-  verify:
-    name: Verify release metadata
+  prepare:
+    name: Bump version, update CHANGELOG, tag
     runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.set.outputs.tag }}
+      version: ${{ steps.set.outputs.version }}
+      sha: ${{ steps.commit.outputs.sha }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Tag matches Cargo.toml + CHANGELOG entry exists
+      - name: Validate version
+        id: set
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          VERSION=${GITHUB_REF_NAME#v}
-          CARGO_VERSION=$(grep -E '^version' Cargo.toml | head -1 | sed -E 's/^version = "(.+)"$/\1/')
-          if [ "$VERSION" != "$CARGO_VERSION" ]; then
-            echo "::error::Tag $GITHUB_REF_NAME implies version $VERSION but Cargo.toml is $CARGO_VERSION."
-            echo "::error::Bump Cargo.toml in a PR before tagging the release."
-            exit 1
-          fi
-          if ! grep -qE "^## v${VERSION//./\\.}( |\$)" CHANGELOG.md; then
-            echo "::error::CHANGELOG.md is missing a '## v${VERSION}' section."
-            echo "::error::Add the entry in the release PR before tagging."
-            exit 1
-          fi
-          echo "Verified: tag $GITHUB_REF_NAME, Cargo.toml $CARGO_VERSION, CHANGELOG entry present."
+          set -euo pipefail
+          VERSION="${{ inputs.version }}"
+          VERSION="${VERSION#v}"
 
-  ci:
-    name: CI
-    needs: verify
-    uses: ./.github/workflows/ci.yml
+          if ! echo "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::Invalid version: ${VERSION} (must be MAJOR.MINOR.PATCH)"
+            exit 1
+          fi
+
+          CURRENT=$(grep -E '^version' Cargo.toml | head -1 | sed -E 's/^version = "(.+)"$/\1/')
+          if ! dpkg --compare-versions "$VERSION" gt "$CURRENT"; then
+            echo "::error::Version ${VERSION} must be greater than current Cargo.toml version ${CURRENT}"
+            exit 1
+          fi
+
+          if git rev-parse "v${VERSION}" >/dev/null 2>&1; then
+            echo "::error::Tag v${VERSION} already exists"
+            exit 1
+          fi
+
+          if gh release view "v${VERSION}" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::error::Release v${VERSION} already exists"
+            exit 1
+          fi
+
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=v${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install PAM headers
+        run: sudo apt-get install -y libpam0g-dev
+
+      - name: Bump Cargo.toml + Cargo.lock
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.set.outputs.version }}"
+          # Replace only the first `version = "..."` line — that's the [package] one.
+          sed -i -E "0,/^version = / s/^version = \"[^\"]+\"/version = \"${VERSION}\"/" Cargo.toml
+          # Update only the workspace package's pin in Cargo.lock; leaves deps alone.
+          cargo update -p pam-ssh-agent-webauthn
+
+      - name: Prepend CHANGELOG entry
+        env:
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.set.outputs.version }}"
+
+          PREV_TAG=$(git tag --list 'v*' --sort=-v:refname | head -1 || true)
+          if [ -n "$PREV_TAG" ]; then
+            NOTES=$(git log "${PREV_TAG}..HEAD" --pretty=format:"- %s" || true)
+            [ -z "$NOTES" ] && NOTES="- No changes since ${PREV_TAG}"
+          else
+            NOTES="- Initial release"
+          fi
+          # Convert (#N) PR refs to clickable links
+          NOTES=$(echo "$NOTES" | sed -E "s|\\(#([0-9]+)\\)|([#\\1](https://github.com/${REPO}/pull/\\1))|g")
+
+          ENTRY="## v${VERSION} ($(date -u +%Y-%m-%d))"
+
+          # If the user pre-edited a section for this version, leave it alone.
+          if grep -qE "^## v${VERSION//./\\.}( |\$)" CHANGELOG.md 2>/dev/null; then
+            echo "CHANGELOG.md already has a section for v${VERSION}; leaving it as-is"
+            exit 0
+          fi
+
+          {
+            printf '%s\n\n' "$ENTRY"
+            printf '%s\n\n' "$NOTES"
+            [ -f CHANGELOG.md ] && cat CHANGELOG.md
+          } > CHANGELOG.md.new
+          mv CHANGELOG.md.new CHANGELOG.md
+
+      - name: Pre-flight clippy + test on bumped tree
+        run: |
+          cargo clippy -- -D warnings
+          cargo test
+
+      - name: Commit, tag, push main
+        id: commit
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.set.outputs.tag }}"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add Cargo.toml Cargo.lock CHANGELOG.md
+          if git diff --cached --quiet; then
+            echo "::error::Nothing to commit — Cargo.toml/CHANGELOG already at v${{ steps.set.outputs.version }} but no release exists. Investigate manually."
+            exit 1
+          fi
+          git commit -m "chore: release ${TAG}"
+          NEW_SHA=$(git rev-parse HEAD)
+          echo "sha=${NEW_SHA}" >> "$GITHUB_OUTPUT"
+
+          git tag "${TAG}" "${NEW_SHA}"
+          git push origin HEAD:main
+          git push origin "refs/tags/${TAG}"
 
   build:
     name: Build (${{ matrix.arch }})
-    needs: ci
+    needs: prepare
     runs-on: ${{ matrix.runner }}
     strategy:
       matrix:
@@ -52,6 +165,8 @@ jobs:
             cross: true
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -92,7 +207,7 @@ jobs:
       - name: Rename artifact
         id: rename
         run: |
-          VERSION=${GITHUB_REF_NAME#v}
+          VERSION="${{ needs.prepare.outputs.version }}"
           ARTIFACT="pam-ssh-agent-webauthn_${VERSION}_${{ matrix.arch }}.so"
           cp target/${{ matrix.target }}/release/libpam_ssh_agent_webauthn.so "${ARTIFACT}"
           echo "artifact=${ARTIFACT}" >> "$GITHUB_OUTPUT"
@@ -105,11 +220,12 @@ jobs:
 
   release:
     name: Package & Release
-    needs: build
+    needs: [prepare, build]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ needs.prepare.outputs.sha }}
           fetch-depth: 0
 
       - name: Download prebuilt binaries
@@ -127,46 +243,27 @@ jobs:
 
       - name: Package source
         run: |
-          VERSION=${GITHUB_REF_NAME#v}
+          set -euo pipefail
+          VERSION="${{ needs.prepare.outputs.version }}"
           ARCHIVE="pam-ssh-agent-webauthn_${VERSION}"
-
           mkdir -p "${ARCHIVE}"
-          cp -r Cargo.toml \
-                Cargo.lock \
-                LICENSE \
-                README.md \
-                CHANGELOG.md \
-                src \
-                examples \
-                tests \
-                "${ARCHIVE}/"
-
+          cp -r Cargo.toml Cargo.lock LICENSE README.md CHANGELOG.md src examples tests "${ARCHIVE}/"
           zip -r "${ARCHIVE}.zip" "${ARCHIVE}"
           sha256sum "${ARCHIVE}.zip" > "${ARCHIVE}.zip.sha256"
           tar czf "${ARCHIVE}.tar.gz" "${ARCHIVE}"
           sha256sum "${ARCHIVE}.tar.gz" > "${ARCHIVE}.tar.gz.sha256"
 
       - name: Generate release notes
-        id: notes
         run: |
-          PREV_TAG=$(git tag --list 'v*' --sort=-v:refname | grep -v "$GITHUB_REF_NAME" | head -1)
-          if [ -n "$PREV_TAG" ]; then
-            RANGE="${PREV_TAG}..${GITHUB_REF_NAME}"
-          else
-            RANGE="$GITHUB_REF_NAME"
-          fi
+          set -euo pipefail
+          VERSION="${{ needs.prepare.outputs.version }}"
+          # Extract just this version's section from CHANGELOG.md
+          SECTION=$(awk -v ver="v${VERSION}" '
+            $0 ~ "^## " ver "([[:space:]]|$)" { found=1; next }
+            found && $0 ~ "^## " { exit }
+            found
+          ' CHANGELOG.md)
 
-          NOTES=$(git log "$RANGE" --pretty=format:"* %s (%h)")
-          if [ -z "$NOTES" ]; then
-            NOTES="* Initial release"
-          fi
-
-          # Convert PR references to clickable markdown links
-          NOTES=$(echo "$NOTES" | sed -E 's|\(#([0-9]+)\)|([#\1](https://github.com/${{ github.repository }}/pull/\1))|g')
-          REPO="${{ github.repository }}"
-          NOTES=$(echo "$NOTES" | sed -E "s|([^(])https://github\\.com/${REPO}/pull/([0-9]+)|\1[#\2](https://github.com/${REPO}/pull/\2)|g")
-
-          VERSION=${GITHUB_REF_NAME#v}
           {
             echo "## Prebuilt binaries"
             echo ""
@@ -193,19 +290,19 @@ jobs:
             echo "cargo build --release"
             echo "\`\`\`"
             echo ""
-            echo "See [README.md](https://github.com/${{ github.repository }}/blob/${GITHUB_REF_NAME}/README.md) for full build and setup instructions."
+            echo "See [README.md](https://github.com/${{ github.repository }}/blob/v${VERSION}/README.md) for full build and setup instructions."
             echo ""
             echo "## Changes"
             echo ""
-            echo "$NOTES"
+            echo "$SECTION"
           } > /tmp/release-notes.md
 
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          VERSION=${GITHUB_REF_NAME#v}
-          gh release create "$GITHUB_REF_NAME" \
+          VERSION="${{ needs.prepare.outputs.version }}"
+          gh release create "v${VERSION}" \
             --title "pam-ssh-agent-webauthn ${VERSION}" \
             --notes-file /tmp/release-notes.md \
             binaries/pam-ssh-agent-webauthn_${VERSION}_amd64.so \
@@ -216,8 +313,3 @@ jobs:
             pam-ssh-agent-webauthn_${VERSION}.zip.sha256 \
             pam-ssh-agent-webauthn_${VERSION}.tar.gz \
             pam-ssh-agent-webauthn_${VERSION}.tar.gz.sha256
-
-      # CHANGELOG is hand-edited in the release PR and verified by the
-      # `verify` job above — no auto-commit back to main/develop. This avoids
-      # the prior pattern where the bot pushed malformed entries to a
-      # protected branch and broke format:check on the next CI run.
