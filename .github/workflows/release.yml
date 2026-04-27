@@ -114,12 +114,29 @@ jobs:
             exit 0
           fi
 
+          # Insert the new entry above the first `## ` section (i.e. below any
+          # leading `# Changelog` title). If there is no existing `## ` section,
+          # append at end of file.
           {
             printf '%s\n\n' "$ENTRY"
-            printf '%s\n\n' "$NOTES"
-            [ -f CHANGELOG.md ] && cat CHANGELOG.md
-          } > CHANGELOG.md.new
-          mv CHANGELOG.md.new CHANGELOG.md
+            printf '%s\n' "$NOTES"
+            printf '\n'
+          } > /tmp/new-entry.md
+
+          if [ ! -f CHANGELOG.md ]; then
+            cp /tmp/new-entry.md CHANGELOG.md
+          else
+            INSERT_LINE=$(grep -nE '^## ' CHANGELOG.md | head -1 | cut -d: -f1 || true)
+            if [ -z "$INSERT_LINE" ]; then
+              cat CHANGELOG.md /tmp/new-entry.md > CHANGELOG.md.new
+            else
+              head -n $((INSERT_LINE - 1)) CHANGELOG.md > CHANGELOG.md.new
+              cat /tmp/new-entry.md >> CHANGELOG.md.new
+              tail -n +"$INSERT_LINE" CHANGELOG.md >> CHANGELOG.md.new
+            fi
+            mv CHANGELOG.md.new CHANGELOG.md
+          fi
+          rm -f /tmp/new-entry.md
 
       - name: Pre-flight clippy + test on bumped tree
         run: |
