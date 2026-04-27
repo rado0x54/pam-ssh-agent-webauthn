@@ -36,7 +36,7 @@ jobs:
     uses: ./.github/workflows/ci.yml
 
   build:
-    name: Build (${{ matrix.target }})
+    name: Build (${{ matrix.arch }})
     needs: ci
     runs-on: ${{ matrix.runner }}
     strategy:
@@ -44,11 +44,11 @@ jobs:
         include:
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-22.04
-            artifact: pam_ssh_webauthn-x86_64-linux-gnu.so
+            arch: amd64
             cross: false
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-22.04
-            artifact: pam_ssh_webauthn-aarch64-linux-gnu.so
+            arch: arm64
             cross: true
     steps:
       - uses: actions/checkout@v4
@@ -90,15 +90,18 @@ jobs:
         run: cargo build --release --target ${{ matrix.target }}
 
       - name: Rename artifact
+        id: rename
         run: |
-          cp target/${{ matrix.target }}/release/libpam_ssh_webauthn.so \
-             ${{ matrix.artifact }}
+          VERSION=${GITHUB_REF_NAME#v}
+          ARTIFACT="pam-ssh-agent-webauthn_${VERSION}_${{ matrix.arch }}.so"
+          cp target/${{ matrix.target }}/release/libpam_ssh_agent_webauthn.so "${ARTIFACT}"
+          echo "artifact=${ARTIFACT}" >> "$GITHUB_OUTPUT"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact }}
-          path: ${{ matrix.artifact }}
+          name: ${{ steps.rename.outputs.artifact }}
+          path: ${{ steps.rename.outputs.artifact }}
 
   release:
     name: Package & Release
@@ -125,7 +128,7 @@ jobs:
       - name: Package source
         run: |
           VERSION=${GITHUB_REF_NAME#v}
-          ARCHIVE="pam_ssh_webauthn-${VERSION}-source"
+          ARCHIVE="pam-ssh-agent-webauthn_${VERSION}"
 
           mkdir -p "${ARCHIVE}"
           cp -r Cargo.toml \
@@ -170,13 +173,13 @@ jobs:
             echo "Prebuilt \`.so\` modules are available for common targets. Download the one matching your architecture and copy it into place:"
             echo ""
             echo "\`\`\`bash"
-            echo "sudo cp pam_ssh_webauthn-x86_64-linux-gnu.so /usr/lib/x86_64-linux-gnu/security/pam_ssh_webauthn.so"
+            echo "sudo cp pam-ssh-agent-webauthn_${VERSION}_amd64.so /usr/lib/x86_64-linux-gnu/security/pam_ssh_agent_webauthn.so"
             echo "\`\`\`"
             echo ""
             echo "| File | Target |"
             echo "|------|--------|"
-            echo "| \`pam_ssh_webauthn-x86_64-linux-gnu.so\` | x86_64 Linux (glibc, Ubuntu 22.04+, Debian 12+, RHEL 9+) |"
-            echo "| \`pam_ssh_webauthn-aarch64-linux-gnu.so\` | ARM64 Linux (glibc, Ubuntu 22.04+, Debian 12+, Graviton) |"
+            echo "| \`pam-ssh-agent-webauthn_${VERSION}_amd64.so\` | x86_64 Linux (glibc, Ubuntu 22.04+, Debian 12+, RHEL 9+) |"
+            echo "| \`pam-ssh-agent-webauthn_${VERSION}_arm64.so\` | ARM64 Linux (glibc, Ubuntu 22.04+, Debian 12+, Graviton) |"
             echo ""
             echo "These are dynamically linked against \`libpam\` and \`libc\` (glibc 2.35+). Built on Ubuntu 22.04."
             echo ""
@@ -185,8 +188,8 @@ jobs:
             echo "For other targets, or if you need the \`native-crypto\` (OpenSSL/FIPS) feature:"
             echo ""
             echo "\`\`\`bash"
-            echo "tar xzf pam_ssh_webauthn-${VERSION}-source.tar.gz"
-            echo "cd pam_ssh_webauthn-${VERSION}-source"
+            echo "tar xzf pam-ssh-agent-webauthn_${VERSION}.tar.gz"
+            echo "cd pam-ssh-agent-webauthn_${VERSION}"
             echo "cargo build --release"
             echo "\`\`\`"
             echo ""
@@ -203,16 +206,16 @@ jobs:
         run: |
           VERSION=${GITHUB_REF_NAME#v}
           gh release create "$GITHUB_REF_NAME" \
-            --title "pam_ssh_webauthn ${VERSION}" \
+            --title "pam-ssh-agent-webauthn ${VERSION}" \
             --notes-file /tmp/release-notes.md \
-            binaries/pam_ssh_webauthn-x86_64-linux-gnu.so \
-            binaries/pam_ssh_webauthn-x86_64-linux-gnu.so.sha256 \
-            binaries/pam_ssh_webauthn-aarch64-linux-gnu.so \
-            binaries/pam_ssh_webauthn-aarch64-linux-gnu.so.sha256 \
-            pam_ssh_webauthn-${VERSION}-source.zip \
-            pam_ssh_webauthn-${VERSION}-source.zip.sha256 \
-            pam_ssh_webauthn-${VERSION}-source.tar.gz \
-            pam_ssh_webauthn-${VERSION}-source.tar.gz.sha256
+            binaries/pam-ssh-agent-webauthn_${VERSION}_amd64.so \
+            binaries/pam-ssh-agent-webauthn_${VERSION}_amd64.so.sha256 \
+            binaries/pam-ssh-agent-webauthn_${VERSION}_arm64.so \
+            binaries/pam-ssh-agent-webauthn_${VERSION}_arm64.so.sha256 \
+            pam-ssh-agent-webauthn_${VERSION}.zip \
+            pam-ssh-agent-webauthn_${VERSION}.zip.sha256 \
+            pam-ssh-agent-webauthn_${VERSION}.tar.gz \
+            pam-ssh-agent-webauthn_${VERSION}.tar.gz.sha256
 
       # CHANGELOG is hand-edited in the release PR and verified by the
       # `verify` job above — no auto-commit back to main/develop. This avoids

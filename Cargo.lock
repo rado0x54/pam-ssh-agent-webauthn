@@ -479,7 +479,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "pam_ssh_webauthn"
+name = "pam-ssh-agent-webauthn"
 version = "0.0.2"
 dependencies = [
  "base64",

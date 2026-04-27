@@ -1,5 +1,5 @@
 [package]
-name = "pam_ssh_webauthn"
+name = "pam-ssh-agent-webauthn"
 version = "0.0.2"
 edition = "2021"
 description = "PAM module for WebAuthn passkey-protected sudo via SSH agent forwarding"
@@ -11,6 +11,7 @@ keywords = ["pam", "webauthn", "ssh-agent", "fido2", "passkey"]
 categories = ["authentication"]
 
 [lib]
+name = "pam_ssh_agent_webauthn"
 crate-type = ["lib", "cdylib"]
 
 [dependencies]

@@ -1,4 +1,4 @@
-# pam_ssh_webauthn
+# pam-ssh-agent-webauthn
 
 A PAM module that authenticates users via WebAuthn passkeys through a forwarded SSH agent. It verifies `webauthn-sk-ecdsa-sha2-nistp256@openssh.com` signatures — the key type produced when a FIDO2/WebAuthn authenticator is used as an SSH key with a non-`ssh:` relying party ID.
 
@@ -60,8 +60,8 @@ sudo dnf install pam-devel       # Fedora/RHEL
 cargo build --release
 
 # The PAM module is at:
-# target/release/libpam_ssh_webauthn.so  (Linux)
-# target/release/libpam_ssh_webauthn.dylib  (macOS)
+# target/release/libpam_ssh_agent_webauthn.so  (Linux)
+# target/release/libpam_ssh_agent_webauthn.dylib  (macOS)
 ```
 
 ### FIPS / OpenSSL backend
@@ -80,10 +80,10 @@ This requires OpenSSL development headers (`libssl-dev` / `openssl-devel`).
 
 ```bash
 # Linux
-sudo cp target/release/libpam_ssh_webauthn.so /usr/lib/x86_64-linux-gnu/security/pam_ssh_webauthn.so
+sudo cp target/release/libpam_ssh_agent_webauthn.so /usr/lib/x86_64-linux-gnu/security/pam_ssh_agent_webauthn.so
 
 # macOS (for testing)
-sudo cp target/release/libpam_ssh_webauthn.dylib /usr/lib/pam/pam_ssh_webauthn.so
+sudo cp target/release/libpam_ssh_agent_webauthn.dylib /usr/lib/pam/pam_ssh_agent_webauthn.so
 ```
 
 ### 2. Add authorized keys
@@ -101,19 +101,19 @@ The key must be the exact key blob the SSH agent presents — same EC point and 
 Add to `/etc/pam.d/sudo` (before other auth lines):
 
 ```
-auth sufficient pam_ssh_webauthn.so
+auth sufficient pam_ssh_agent_webauthn.so
 ```
 
 Or with a custom key file path:
 
 ```
-auth sufficient pam_ssh_webauthn.so file=/path/to/authorized_keys
+auth sufficient pam_ssh_agent_webauthn.so file=/path/to/authorized_keys
 ```
 
 To override the agent socket path (instead of `$SSH_AUTH_SOCK`):
 
 ```
-auth sufficient pam_ssh_webauthn.so socket=/path/to/agent.sock
+auth sufficient pam_ssh_agent_webauthn.so socket=/path/to/agent.sock
 ```
 
 ### 4. Preserve SSH_AUTH_SOCK for sudo
@@ -194,7 +194,7 @@ The following checks are performed, matching OpenSSH's `webauthn_check_prepare_h
 
 ## Logging
 
-Logs to syslog facility `AUTH` as `pam_ssh_webauthn`. Set log level via PAM or syslog configuration.
+Logs to syslog facility `AUTH` as `pam_ssh_agent_webauthn`. Set log level via PAM or syslog configuration.
 
 ## Troubleshooting
 

@@ -14,7 +14,7 @@ fn main() {
     println!("Socket: {socket_path}");
     println!("Key file: {key_file}");
 
-    match pam_ssh_webauthn::authenticate(Path::new(&socket_path), Path::new(&key_file)) {
+    match pam_ssh_agent_webauthn::authenticate(Path::new(&socket_path), Path::new(&key_file)) {
         Ok(true) => println!("\n✅ Authentication successful"),
         Ok(false) => println!("\n❌ No matching key found"),
         Err(e) => println!("\n❌ Authentication failed: {e}"),

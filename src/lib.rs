@@ -1,4 +1,4 @@
-//! pam_ssh_webauthn — PAM module for WebAuthn passkey-protected sudo.
+//! pam_ssh_agent_webauthn — PAM module for WebAuthn passkey-protected sudo.
 //!
 //! Authenticates via a forwarded SSH agent that holds WebAuthn SK ECDSA keys.
 //! Only supports `webauthn-sk-ecdsa-sha2-nistp256@openssh.com`.
@@ -6,7 +6,7 @@
 //! ## PAM configuration
 //!
 //! ```text
-//! auth sufficient pam_ssh_webauthn.so file=/etc/security/authorized_keys
+//! auth sufficient pam_ssh_agent_webauthn.so file=/etc/security/authorized_keys
 //! ```
 //!
 //! ## How it works
@@ -44,22 +44,22 @@ impl PamHooks for PamSshWebauthn {
         let config = match parse_args(&args) {
             Ok(c) => c,
             Err(e) => {
-                error!("pam_ssh_webauthn: invalid config: {e}");
+                error!("pam_ssh_agent_webauthn: invalid config: {e}");
                 return PamResultCode::PAM_SERVICE_ERR;
             }
         };
 
         match do_authenticate(&config, handle) {
             Ok(true) => {
-                info!("pam_ssh_webauthn: authentication successful");
+                info!("pam_ssh_agent_webauthn: authentication successful");
                 PamResultCode::PAM_SUCCESS
             }
             Ok(false) => {
-                info!("pam_ssh_webauthn: no matching key");
+                info!("pam_ssh_agent_webauthn: no matching key");
                 PamResultCode::PAM_AUTH_ERR
             }
             Err(e) => {
-                error!("pam_ssh_webauthn: authentication failed: {e}");
+                error!("pam_ssh_agent_webauthn: authentication failed: {e}");
                 PamResultCode::PAM_AUTH_ERR
             }
         }
@@ -97,7 +97,7 @@ fn parse_args(args: &[&CStr]) -> Result<Config, String> {
 
 fn do_authenticate(config: &Config, handle: &mut PamHandle) -> Result<bool, Box<dyn std::error::Error>> {
     let user = handle.get_user(None).unwrap_or_else(|_| "unknown".to_string());
-    info!("pam_ssh_webauthn: authenticating user '{user}'");
+    info!("pam_ssh_agent_webauthn: authenticating user '{user}'");
 
     // Read authorized keys
     let authorized_keys = keys::parse_authorized_keys(Path::new(&config.key_file))?;
@@ -156,13 +156,13 @@ fn do_authenticate(config: &Config, handle: &mut PamHandle) -> Result<bool, Box<
                         e.downcast_ref::<agent::SignError>()
                     {
                         error!(
-                            "pam_ssh_webauthn: transport error talking to agent for key '{}': {e}",
+                            "pam_ssh_agent_webauthn: transport error talking to agent for key '{}': {e}",
                             auth_key.comment
                         );
                         return Err(e);
                     }
                     warn!(
-                        "pam_ssh_webauthn: key '{}' failed, trying next: {e}",
+                        "pam_ssh_agent_webauthn: key '{}' failed, trying next: {e}",
                         auth_key.comment
                     );
                 }
@@ -201,7 +201,7 @@ fn init_logging() {
     let _ = syslog::init(
         syslog::Facility::LOG_AUTH,
         log::LevelFilter::Info,
-        Some("pam_ssh_webauthn"),
+        Some("pam_ssh_agent_webauthn"),
     );
 }
 

@@ -258,7 +258,7 @@ fn setup(corrupt_challenge: bool) -> TestSetup {
 fn test_webauthn_roundtrip() {
     let setup = setup(false);
 
-    let result = pam_ssh_webauthn::authenticate(&setup.socket_path, &setup.key_file);
+    let result = pam_ssh_agent_webauthn::authenticate(&setup.socket_path, &setup.key_file);
     assert!(result.is_ok(), "authenticate should succeed: {result:?}");
     assert!(result.unwrap(), "should return true for valid key");
 }
@@ -272,7 +272,7 @@ fn test_webauthn_wrong_challenge() {
     // we only have one matching key, so all matches are exhausted and we get
     // Ok(false) — auth failed, but cleanly (so PAM falls through to the next
     // module rather than reporting a service error).
-    let result = pam_ssh_webauthn::authenticate(&setup.socket_path, &setup.key_file);
+    let result = pam_ssh_agent_webauthn::authenticate(&setup.socket_path, &setup.key_file);
     assert!(matches!(result, Ok(false)), "expected Ok(false), got {result:?}");
 }
 
@@ -359,7 +359,7 @@ fn test_skip_failing_key_then_succeed() {
     // Two keys both authorized; the first returns SSH_AGENT_FAILURE on sign
     // (user denied), the second signs successfully. PAM should iterate past
     // the failed key and authenticate via the second. Regression for the
-    // case where pam_ssh_webauthn previously returned PAM_AUTH_ERR after the
+    // case where pam_ssh_agent_webauthn previously returned PAM_AUTH_ERR after the
     // first matching key failed to sign. See ShellWatch #91.
     let id = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
 
@@ -398,7 +398,7 @@ fn test_skip_failing_key_then_succeed() {
     });
     std::thread::sleep(std::time::Duration::from_millis(50));
 
-    let result = pam_ssh_webauthn::authenticate(&socket_path, &key_file);
+    let result = pam_ssh_agent_webauthn::authenticate(&socket_path, &key_file);
 
     stop.store(true, Ordering::Relaxed);
     let _ = thread.join();
@@ -429,7 +429,7 @@ fn test_transport_error_bubbles_up() {
     let line = format!("{WEBAUTHN_SK_ALGO} {} test-key\n", BASE64_STANDARD.encode(&key_blob));
     std::fs::write(&key_file, &line).unwrap();
 
-    let result = pam_ssh_webauthn::authenticate(&bogus_socket, &key_file);
+    let result = pam_ssh_agent_webauthn::authenticate(&bogus_socket, &key_file);
     let _ = std::fs::remove_file(&key_file);
 
     assert!(result.is_err(), "expected transport Err, got {result:?}");
@@ -451,7 +451,7 @@ fn test_no_matching_key() {
     let key_line = format!("{WEBAUTHN_SK_ALGO} {b64} other-key\n");
     std::fs::write(&setup.key_file, &key_line).unwrap();
 
-    let result = pam_ssh_webauthn::authenticate(&setup.socket_path, &setup.key_file);
+    let result = pam_ssh_agent_webauthn::authenticate(&setup.socket_path, &setup.key_file);
     assert!(result.is_ok());
     assert!(!result.unwrap(), "should return false when no key matches");
 }

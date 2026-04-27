@@ -6,7 +6,7 @@ use std::path::Path;
 fn main() {
     let socket_path = env::var("SSH_AUTH_SOCK").expect("SSH_AUTH_SOCK is not set");
 
-    let identities = pam_ssh_webauthn::agent::list_webauthn_identities(Path::new(&socket_path))
+    let identities = pam_ssh_agent_webauthn::agent::list_webauthn_identities(Path::new(&socket_path))
         .expect("Failed to list identities");
 
     if identities.is_empty() {
