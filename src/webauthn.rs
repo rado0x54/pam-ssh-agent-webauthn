@@ -415,8 +415,12 @@ fn parse_ecdsa_p256_signature(sig_bytes: &[u8]) -> Result<p256::ecdsa::Signature
 }
 
 /// Read an SSH mpint and return the unsigned bytes, enforcing canonical
-/// encoding per RFC 4251 §5: zero is the empty string; positive numbers
-/// carry a leading 0x00 only when the next byte's MSB is set.
+/// non-negative encoding per RFC 4251 §5: zero is the empty string; positive
+/// numbers carry a leading 0x00 only when the next byte's MSB is set; values
+/// whose first byte has the MSB set (RFC-canonical two's-complement negatives)
+/// are rejected because R/S in ECDSA must be positive — accepting them would
+/// let a signer encode the same scalar two ways (`[0xFF]` and `[0x00, 0xFF]`
+/// both reduce to 255).
 fn read_ssh_mpint<'a>(reader: &mut &'a [u8]) -> Result<&'a [u8], VerifyError> {
     let bytes = read_ssh_bytes(reader)?;
     match bytes {
@@ -428,6 +432,9 @@ fn read_ssh_mpint<'a>(reader: &mut &'a [u8]) -> Result<&'a [u8], VerifyError> {
             "Non-canonical mpint: unnecessary leading 0x00".to_string(),
         )),
         [0x00, ..] => Ok(&bytes[1..]),
+        [first, ..] if first & 0x80 != 0 => Err(VerifyError::Parse(
+            "Non-canonical mpint: negative (MSB-set) value where positive expected".to_string(),
+        )),
         _ => Ok(bytes),
     }
 }
@@ -613,12 +620,36 @@ mod tests {
     }
 
     #[test]
-    fn test_read_ssh_mpint_strips_leading_zero_when_msb_set() {
+    fn test_read_ssh_mpint_strips_disambiguation_zero() {
         // L2d: canonical sign-disambiguation case — leading 0x00 required because next byte's MSB is set.
         let framed = make_ssh_string(&[0x00, 0x80, 0x00]);
         let mut reader: &[u8] = &framed;
         let result = read_ssh_mpint(&mut reader).unwrap();
         assert_eq!(result, &[0x80, 0x00]);
+    }
+
+    #[test]
+    fn test_read_ssh_mpint_rejects_negative_encoding() {
+        // [0xFF] is RFC-canonical for -1 in two's complement. Without this check,
+        // it would be reinterpreted as unsigned 255 — the same scalar that the
+        // canonical positive encoding [0x00, 0xFF] decodes to, opening a
+        // malleability window for any R/S whose canonical positive form needs
+        // the disambiguation byte.
+        let framed = make_ssh_string(&[0xFF]);
+        let mut reader: &[u8] = &framed;
+        assert!(matches!(
+            read_ssh_mpint(&mut reader).unwrap_err(),
+            VerifyError::Parse(_)
+        ));
+
+        // Same rejection for a 32-byte MSB-set value (would otherwise pad to a
+        // valid-looking P-256 scalar).
+        let framed = make_ssh_string(&[0xFFu8; 32]);
+        let mut reader: &[u8] = &framed;
+        assert!(matches!(
+            read_ssh_mpint(&mut reader).unwrap_err(),
+            VerifyError::Parse(_)
+        ));
     }
 
     #[test]
