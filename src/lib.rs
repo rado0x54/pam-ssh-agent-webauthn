@@ -530,7 +530,7 @@ pub fn authenticate(
     socket_path: &Path,
     key_file: &Path,
 ) -> Result<bool, Box<dyn std::error::Error>> {
-    authenticate_with_max_attempts(socket_path, key_file, DEFAULT_MAX_SIGN_ATTEMPTS)
+    authenticate_with_options(socket_path, key_file, DEFAULT_MAX_SIGN_ATTEMPTS, false)
 }
 
 /// Like [`authenticate`] but with a caller-supplied cap on how many sign
@@ -547,6 +547,24 @@ pub fn authenticate_with_max_attempts(
     socket_path: &Path,
     key_file: &Path,
     max_attempts: usize,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    authenticate_with_options(socket_path, key_file, max_attempts, false)
+}
+
+/// Like [`authenticate_with_max_attempts`] but also exposes the module-wide
+/// `verify_required` knob, so integration tests can drive the full UV
+/// pipeline (parse_args → Config.verify_required → try_authenticate →
+/// validate_flags) end-to-end. Per-key `verify-required` from
+/// `authorized_keys` is OR-combined as in the PAM hook — stricter wins.
+///
+/// `#[doc(hidden)]`: same caveat as [`authenticate`] — test helper, not
+/// part of the supported API surface.
+#[doc(hidden)]
+pub fn authenticate_with_options(
+    socket_path: &Path,
+    key_file: &Path,
+    max_attempts: usize,
+    module_uv_required: bool,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     if max_attempts == 0 {
         return Err("max_attempts must be >= 1".into());
@@ -572,10 +590,8 @@ pub fn authenticate_with_max_attempts(
     // in the PAM hook context (root, syslog wired up). If this helper is
     // ever promoted out of `#[doc(hidden)]` to a supported API, switch to
     // `iter_attempts` so embedders get the same observability.
-    // Test helper: leave the module-wide UV knob off. The per-key
-    // `verify-required` flag still applies because it's stored on the key.
     for (agent_id, auth_key) in matched.iter().take(max_attempts) {
-        match try_authenticate(socket_path, auth_key, &agent_id.key_blob, false) {
+        match try_authenticate(socket_path, auth_key, &agent_id.key_blob, module_uv_required) {
             Ok(()) => return Ok(true),
             Err(TryAuthOutcome::Transport(e)) => return Err(Box::new(e)),
             Err(TryAuthOutcome::Random(msg)) => return Err(msg.into()),

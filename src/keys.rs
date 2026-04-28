@@ -81,11 +81,12 @@ pub fn parse_authorized_keys_str(content: &str) -> Vec<WebAuthnPublicKey> {
 /// Format: `[options] webauthn-sk-ecdsa-sha2-nistp256@openssh.com <base64> [comment]`
 ///
 /// Tokenisation matches OpenSSH's `authorized_keys(5)` grammar (see
-/// `sshkey_advance_past_options` in OpenSSH `authfile.c`): the options
-/// block, if present, ends at the first **unquoted** whitespace, with `\"`
-/// recognised as the only escape inside `"..."`. This matters because
-/// option values can carry embedded spaces or commas (`command="ls -la"`,
-/// `from="a,b"`) which a naïve whitespace split would mishandle.
+/// `sshkey_advance_past_options` in OpenSSH's authfile module): the
+/// options block, if present, ends at the first **unquoted** whitespace,
+/// with `\"` recognised as the only escape inside `"..."`. This matters
+/// because option values can carry embedded spaces or commas
+/// (`command="ls -la"`, `from="a,b"`) which a naïve whitespace split
+/// would mishandle.
 ///
 /// Of the recognised flag options, only `verify-required` is acted on; the
 /// rest (`cert-authority`, `command="..."`, `from="..."`, `principals=`,
@@ -157,10 +158,9 @@ fn line_starts_with_algo(line: &str) -> bool {
 }
 
 /// Advance past an authorized_keys options block, mirroring OpenSSH's
-/// `sshkey_advance_past_options` (authfile.c:463): the block ends at the
-/// first **unquoted** whitespace, with `\"` as the only escape inside
-/// `"..."`. Returns the byte offset where the block ends, or `None` if
-/// quotes are unterminated.
+/// `sshkey_advance_past_options`: the block ends at the first **unquoted**
+/// whitespace, with `\"` as the only escape inside `"..."`. Returns the
+/// byte offset where the block ends, or `None` if quotes are unterminated.
 fn advance_past_options(s: &str) -> Option<usize> {
     let bytes = s.as_bytes();
     let mut i = 0;
@@ -188,13 +188,24 @@ fn advance_past_options(s: &str) -> Option<usize> {
 
 /// Returns true iff the comma-separated authorized_keys options block
 /// `opts` contains a `verify-required` flag option, with quote awareness
-/// per OpenSSH's `opt_dequote` (misc.c:2696): inside `"..."`, commas are
-/// literal and `\"` is the only escape. Option names are matched
-/// case-insensitively (`strncasecmp` in OpenSSH).
+/// per OpenSSH's `opt_dequote`: inside `"..."`, commas are literal and
+/// `\"` is the only escape. Option names are matched case-insensitively
+/// (`strncasecmp` in OpenSSH).
 ///
-/// Quote awareness matters because an option like `from="a,verify-required,b"`
-/// embeds commas in its quoted value — a naïve `split(',')` would falsely
-/// pull `verify-required` out of that value.
+/// Quote awareness matters because an option like
+/// `from="a,verify-required,b"` embeds commas in its quoted value — a
+/// naïve `split(',')` would falsely pull `verify-required` out of that
+/// value.
+///
+/// Scope: this function only looks for `verify-required`. Per the project
+/// proposal, every other option (recognised by OpenSSH or not) is
+/// tolerated — including malformed shapes like leading/double commas or
+/// unknown option names. OpenSSH's option loop tolerates empty segments
+/// at the loop level too (its rejections come from the surrounding
+/// "unknown option" / "trailing comma" checks, which are out of scope
+/// here). All ways a malformed line can mis-parse are fail-safe: the
+/// worst outcome is UV gets enforced when the operator didn't intend it,
+/// not the other way around.
 fn options_have_verify_required(opts: &str) -> bool {
     let bytes = opts.as_bytes();
     let mut start = 0;
@@ -417,6 +428,25 @@ mod tests {
         let line = format!(r#"from="oops {WEBAUTHN_SK_ALGO} {b64}"#);
 
         assert!(parse_authorized_key_line(&line).is_none());
+    }
+
+    #[test]
+    fn test_parse_authorized_key_line_tolerates_empty_segments() {
+        // Pin the scope decision documented on `options_have_verify_required`:
+        // empty segments (leading comma, double comma) are tolerated and do
+        // not change behavior. OpenSSH's option loop is similarly permissive
+        // about empty segments per se. Both inputs below contain a real
+        // `verify-required` token, so they must enable UV.
+        let blob = make_test_key_blob("localhost");
+        let b64 = BASE64_STANDARD.encode(&blob);
+
+        // leading comma
+        let leading = format!(",verify-required {WEBAUTHN_SK_ALGO} {b64}");
+        assert!(parse_authorized_key_line(&leading).unwrap().verify_required);
+
+        // double comma between known options
+        let middle = format!("cert-authority,,verify-required {WEBAUTHN_SK_ALGO} {b64}");
+        assert!(parse_authorized_key_line(&middle).unwrap().verify_required);
     }
 
     #[test]

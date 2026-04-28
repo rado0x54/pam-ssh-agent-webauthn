@@ -923,3 +923,70 @@ fn test_uv_not_required_default_accepts_up_only_signature() {
     );
     assert_eq!(observed, 1);
 }
+
+#[test]
+fn test_uv_required_module_wide_rejects_up_only_signature() {
+    // End-to-end coverage for the OTHER half of the OR-combine: the
+    // module-wide `verify_required=yes` arg (which the PAM hook reads
+    // from its module argument list). The key file has NO per-key
+    // option; UV enforcement comes purely from the module-wide knob
+    // threaded through try_authenticate. This locks in the wiring from
+    // Config.verify_required → iter_attempts → try_authenticate →
+    // validate_flags so a future regression that drops the parameter
+    // would be caught at the integration level, not just the parse_args
+    // unit test.
+    let (socket_path, key_file, sign_count, stop, thread) = setup_uv_test(0x01, "");
+
+    // module_uv_required = true, no per-key option → UV demanded only by
+    // the module-wide knob.
+    let result = pam_ssh_agent_webauthn::authenticate_with_options(
+        &socket_path,
+        &key_file,
+        6,
+        true,
+    );
+    let observed = sign_count.load(Ordering::Relaxed);
+
+    stop.store(true, Ordering::Relaxed);
+    let _ = thread.join();
+    let _ = std::fs::remove_file(&socket_path);
+    let _ = std::fs::remove_file(&key_file);
+
+    assert!(
+        matches!(result, Ok(false)),
+        "module-wide verify_required=yes must reject a UP-only signature, got {result:?}"
+    );
+    assert_eq!(
+        observed, 1,
+        "agent should sign once before module-wide UV verification rejects the result"
+    );
+}
+
+#[test]
+fn test_uv_required_module_wide_accepts_uv_signature() {
+    // Positive control for module-wide UV: same module knob set, but the
+    // agent now signs with UP+UV (flags=0x05). Auth must succeed,
+    // proving the rejection in the test above is specifically the UV
+    // check and not some side effect of `authenticate_with_options`
+    // itself.
+    let (socket_path, key_file, sign_count, stop, thread) = setup_uv_test(0x05, "");
+
+    let result = pam_ssh_agent_webauthn::authenticate_with_options(
+        &socket_path,
+        &key_file,
+        6,
+        true,
+    );
+    let observed = sign_count.load(Ordering::Relaxed);
+
+    stop.store(true, Ordering::Relaxed);
+    let _ = thread.join();
+    let _ = std::fs::remove_file(&socket_path);
+    let _ = std::fs::remove_file(&key_file);
+
+    assert!(
+        matches!(result, Ok(true)),
+        "module-wide verify_required=yes must accept a UP+UV signature, got {result:?}"
+    );
+    assert_eq!(observed, 1);
+}
