@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.2.0 (2026-04-28)
+
+- feat(webauthn): reject non-canonical ECDSA signature wire encoding ([#11](https://github.com/rado0x54/pam-ssh-agent-webauthn/pull/11))
+- feat(agent): tighten agent message size cap from 1 MiB to 256 KiB to match OpenSSH ([#10](https://github.com/rado0x54/pam-ssh-agent-webauthn/pull/10))
+- feat: cap sign attempts per pam_authenticate ([#3](https://github.com/rado0x54/pam-ssh-agent-webauthn/pull/3)) ([#9](https://github.com/rado0x54/pam-ssh-agent-webauthn/pull/9))
+- feat(pam): distinguish service errors from auth failures in PAM return codes ([#8](https://github.com/rado0x54/pam-ssh-agent-webauthn/pull/8))
+- feat: harden authorized_keys access with OpenSSH-style safety ladder ([#7](https://github.com/rado0x54/pam-ssh-agent-webauthn/pull/7))
+- docs: codify trust model rationale to prevent re-flagging in future audits ([#6](https://github.com/rado0x54/pam-ssh-agent-webauthn/pull/6))
+- fix(ci): insert new CHANGELOG entry below '# Changelog' title
+
 ## v0.1.0 (2026-04-27)
 
 - Initial release
