@@ -73,15 +73,12 @@ impl PamHooks for PamSshWebauthn {
             }
             Err(e) => {
                 let code = e.pam_code();
-                // Service errors and UserUnknown get error!; everything else
-                // is info!. The distinction matters because admins triaging
-                // a syslog stream should see broken-config / malformed-
-                // protocol issues — and a calling app that failed to set
-                // PAM_USER before pam_authenticate (UserUnknown) is the same
-                // class of "module was called wrong" — separately from the
-                // expected "user denied the touch" / "no agent forwarded"
-                // events.
-                if matches!(e, AuthError::Service(_) | AuthError::UserUnknown) {
+                // Service errors get error!; everything else is info!. The
+                // distinction matters because admins triaging a syslog stream
+                // should see broken-config / malformed-protocol issues
+                // separately from the expected "user denied the touch" /
+                // "no agent forwarded" events.
+                if matches!(e, AuthError::Service(_)) {
                     error!("pam_ssh_agent_webauthn: {e}");
                 } else {
                     info!("pam_ssh_agent_webauthn: {e}");
@@ -126,8 +123,6 @@ enum AuthError {
     /// signature didn't verify, user denied the touch prompt).
     /// Maps to `PAM_AUTH_ERR`.
     AuthFail(String),
-    /// PAM did not supply the user identity. Maps to `PAM_USER_UNKNOWN`.
-    UserUnknown,
 }
 
 impl AuthError {
@@ -136,7 +131,6 @@ impl AuthError {
             Self::Service(_) => PamResultCode::PAM_SERVICE_ERR,
             Self::InfoUnavailable(_) => PamResultCode::PAM_AUTHINFO_UNAVAIL,
             Self::AuthFail(_) => PamResultCode::PAM_AUTH_ERR,
-            Self::UserUnknown => PamResultCode::PAM_USER_UNKNOWN,
         }
     }
 }
@@ -147,7 +141,6 @@ impl std::fmt::Display for AuthError {
             Self::Service(msg) => write!(f, "service error: {msg}"),
             Self::InfoUnavailable(msg) => write!(f, "auth info unavailable: {msg}"),
             Self::AuthFail(msg) => write!(f, "authentication failed: {msg}"),
-            Self::UserUnknown => write!(f, "PAM did not supply user identity"),
         }
     }
 }
@@ -255,9 +248,19 @@ enum TryAuthOutcome {
 }
 
 fn do_authenticate(config: &Config, handle: &mut PamHandle) -> Result<(), AuthError> {
+    // pam-bindings 0.1.1 mishandles the `const char **user` out-parameter of
+    // pam_get_user(3): the FFI binding takes `&*mut c_char` against an
+    // immutably bound pointer, and in release builds the optimizer is free
+    // to drop the C-side write, leaving the wrapper to return `Err(...)`
+    // even when pam_get_user itself returned PAM_SUCCESS.
+    // See anowell/pam-rs#16 (and the corresponding rustsec advisory).
+    // The username is purely informational here — it's logged but never used
+    // in any auth decision (this module verifies a WebAuthn signature
+    // against authorized_keys, not POSIX user identity) — so we tolerate
+    // the failure rather than letting a dependency bug fail authentication.
     let user = handle
         .get_user(None)
-        .map_err(|_| AuthError::UserUnknown)?;
+        .unwrap_or_else(|_| "<unknown>".to_string());
     info!("pam_ssh_agent_webauthn: authenticating user '{user}'");
 
     // Read authorized_keys under the OpenSSH-style safety ladder:
@@ -652,10 +655,6 @@ mod tests {
         assert_eq!(
             AuthError::AuthFail("x".into()).pam_code(),
             PamResultCode::PAM_AUTH_ERR
-        );
-        assert_eq!(
-            AuthError::UserUnknown.pam_code(),
-            PamResultCode::PAM_USER_UNKNOWN
         );
     }
 
