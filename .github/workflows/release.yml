@@ -225,7 +225,7 @@ jobs:
         id: rename
         run: |
           VERSION="${{ needs.prepare.outputs.version }}"
-          ARTIFACT="pam-ssh-agent-webauthn_${VERSION}_${{ matrix.arch }}.so"
+          ARTIFACT="pam_ssh_agent_webauthn-${VERSION}-${{ matrix.arch }}.so"
           cp target/${{ matrix.target }}/release/libpam_ssh_agent_webauthn.so "${ARTIFACT}"
           echo "artifact=${ARTIFACT}" >> "$GITHUB_OUTPUT"
 
@@ -287,13 +287,13 @@ jobs:
             echo "Prebuilt \`.so\` modules are available for common targets. Download the one matching your architecture and copy it into place:"
             echo ""
             echo "\`\`\`bash"
-            echo "sudo cp pam-ssh-agent-webauthn_${VERSION}_amd64.so /usr/lib/x86_64-linux-gnu/security/pam_ssh_agent_webauthn.so"
+            echo "sudo cp pam_ssh_agent_webauthn-${VERSION}-amd64.so /usr/lib/x86_64-linux-gnu/security/pam_ssh_agent_webauthn.so"
             echo "\`\`\`"
             echo ""
             echo "| File | Target |"
             echo "|------|--------|"
-            echo "| \`pam-ssh-agent-webauthn_${VERSION}_amd64.so\` | x86_64 Linux (glibc, Ubuntu 22.04+, Debian 12+, RHEL 9+) |"
-            echo "| \`pam-ssh-agent-webauthn_${VERSION}_arm64.so\` | ARM64 Linux (glibc, Ubuntu 22.04+, Debian 12+, Graviton) |"
+            echo "| \`pam_ssh_agent_webauthn-${VERSION}-amd64.so\` | x86_64 Linux (glibc, Ubuntu 22.04+, Debian 12+, RHEL 9+) |"
+            echo "| \`pam_ssh_agent_webauthn-${VERSION}-arm64.so\` | ARM64 Linux (glibc, Ubuntu 22.04+, Debian 12+, Graviton) |"
             echo ""
             echo "These are dynamically linked against \`libpam\` and \`libc\` (glibc 2.35+). Built on Ubuntu 22.04."
             echo ""
@@ -322,10 +322,10 @@ jobs:
           gh release create "v${VERSION}" \
             --title "pam-ssh-agent-webauthn ${VERSION}" \
             --notes-file /tmp/release-notes.md \
-            binaries/pam-ssh-agent-webauthn_${VERSION}_amd64.so \
-            binaries/pam-ssh-agent-webauthn_${VERSION}_amd64.so.sha256 \
-            binaries/pam-ssh-agent-webauthn_${VERSION}_arm64.so \
-            binaries/pam-ssh-agent-webauthn_${VERSION}_arm64.so.sha256 \
+            binaries/pam_ssh_agent_webauthn-${VERSION}-amd64.so \
+            binaries/pam_ssh_agent_webauthn-${VERSION}-amd64.so.sha256 \
+            binaries/pam_ssh_agent_webauthn-${VERSION}-arm64.so \
+            binaries/pam_ssh_agent_webauthn-${VERSION}-arm64.so.sha256 \
             pam-ssh-agent-webauthn_${VERSION}.zip \
             pam-ssh-agent-webauthn_${VERSION}.zip.sha256 \
             pam-ssh-agent-webauthn_${VERSION}.tar.gz \
