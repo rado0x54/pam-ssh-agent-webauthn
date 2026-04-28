@@ -36,6 +36,7 @@ use log::{debug, error, info, warn};
 use pam::constants::{PamFlag, PamResultCode};
 use pam::module::{PamHandle, PamHooks};
 use std::ffi::CStr;
+use std::io;
 use std::path::Path;
 
 const CHALLENGE_SIZE: usize = 32;
@@ -57,17 +58,22 @@ impl PamHooks for PamSshWebauthn {
         };
 
         match do_authenticate(&config, handle) {
-            Ok(true) => {
+            Ok(()) => {
                 info!("pam_ssh_agent_webauthn: authentication successful");
                 PamResultCode::PAM_SUCCESS
             }
-            Ok(false) => {
-                info!("pam_ssh_agent_webauthn: no matching key");
-                PamResultCode::PAM_AUTH_ERR
-            }
             Err(e) => {
-                error!("pam_ssh_agent_webauthn: authentication failed: {e}");
-                PamResultCode::PAM_AUTH_ERR
+                let code = e.pam_code();
+                // Service errors get error!; everything else is info!. The
+                // distinction matters because admins triaging a syslog stream
+                // should see broken-config / malformed-protocol issues
+                // separately from "user denied the touch."
+                if matches!(e, AuthError::Service(_)) {
+                    error!("pam_ssh_agent_webauthn: {e}");
+                } else {
+                    info!("pam_ssh_agent_webauthn: {e}");
+                }
+                code
             }
         }
     }
@@ -85,6 +91,63 @@ impl PamHooks for PamSshWebauthn {
         // alike. Other auth-only modules (pam_google_authenticator, upstream
         // pam-ssh-agent) make the same choice for the same reason.
         PamResultCode::PAM_SUCCESS
+    }
+}
+
+/// Categorizes auth failures by the PAM return code they should map to.
+/// The discrimination matters for PAM stacks composed with
+/// `[success=ok default=ignore]` and similar patterns: admins need to
+/// distinguish "this module is broken" from "this user isn't authorized"
+/// from "this module needs information it doesn't have."
+#[derive(Debug)]
+enum AuthError {
+    /// Module is misconfigured or saw a corrupted protocol message.
+    /// Maps to `PAM_SERVICE_ERR`.
+    Service(String),
+    /// Information needed to authenticate isn't available — no agent
+    /// socket, no keys configured, agent unreachable. The module itself
+    /// is fine; PAM stacks should be able to fall through cleanly.
+    /// Maps to `PAM_AUTHINFO_UNAVAIL`.
+    InfoUnavailable(String),
+    /// User genuinely failed to prove possession (no matching key,
+    /// signature didn't verify, user denied the touch prompt).
+    /// Maps to `PAM_AUTH_ERR`.
+    AuthFail(String),
+    /// PAM did not supply the user identity. Maps to `PAM_USER_UNKNOWN`.
+    UserUnknown,
+}
+
+impl AuthError {
+    fn pam_code(&self) -> PamResultCode {
+        match self {
+            Self::Service(_) => PamResultCode::PAM_SERVICE_ERR,
+            Self::InfoUnavailable(_) => PamResultCode::PAM_AUTHINFO_UNAVAIL,
+            Self::AuthFail(_) => PamResultCode::PAM_AUTH_ERR,
+            Self::UserUnknown => PamResultCode::PAM_USER_UNKNOWN,
+        }
+    }
+}
+
+impl std::fmt::Display for AuthError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Service(msg) => write!(f, "service error: {msg}"),
+            Self::InfoUnavailable(msg) => write!(f, "auth info unavailable: {msg}"),
+            Self::AuthFail(msg) => write!(f, "authentication failed: {msg}"),
+            Self::UserUnknown => write!(f, "PAM did not supply user identity"),
+        }
+    }
+}
+
+/// Classify an `io::Error` from the agent path into an `AuthError`.
+/// `InvalidData` indicates a malformed wire-format response (the agent
+/// is broken, not unreachable); everything else is treated as a transport
+/// problem — `InfoUnavailable` so PAM stacks can fall through.
+fn classify_io_err(e: io::Error, ctx: &str) -> AuthError {
+    if e.kind() == io::ErrorKind::InvalidData {
+        AuthError::Service(format!("{ctx}: malformed agent protocol: {e}"))
+    } else {
+        AuthError::InfoUnavailable(format!("{ctx}: {e}"))
     }
 }
 
@@ -127,8 +190,28 @@ fn parse_args(args: &[&CStr]) -> Result<Config, String> {
     })
 }
 
-fn do_authenticate(config: &Config, handle: &mut PamHandle) -> Result<bool, Box<dyn std::error::Error>> {
-    let user = handle.get_user(None).unwrap_or_else(|_| "unknown".to_string());
+/// Outcome of a single sign-and-verify attempt. Distinguishes soft failures
+/// (try the next matching key) from hard failures (propagate).
+enum TryAuthOutcome {
+    /// Agent rejected the sign request — user denied the prompt, key not
+    /// loaded, agent policy refused.
+    Refused(String),
+    /// Agent signed but the signature didn't verify under our public key.
+    /// Try the next matching identity in case the agent presented the
+    /// wrong key.
+    VerifyFailed(String),
+    /// Transport-level I/O failure or malformed agent reply.
+    /// Caller maps via `classify_io_err` to either Service or InfoUnavailable.
+    Transport(io::Error),
+    /// Failed to generate a fresh random challenge — system entropy issue.
+    /// Maps to Service.
+    Random(String),
+}
+
+fn do_authenticate(config: &Config, handle: &mut PamHandle) -> Result<(), AuthError> {
+    let user = handle
+        .get_user(None)
+        .map_err(|_| AuthError::UserUnknown)?;
     info!("pam_ssh_agent_webauthn: authenticating user '{user}'");
 
     // Read authorized_keys under the OpenSSH-style safety ladder:
@@ -138,11 +221,14 @@ fn do_authenticate(config: &Config, handle: &mut PamHandle) -> Result<bool, Box<
         strict_modes: config.strict_modes,
         ..Default::default()
     };
-    let content = authfile::open_secure(Path::new(&config.key_file), &opts)?;
+    let content = authfile::open_secure(Path::new(&config.key_file), &opts)
+        .map_err(|e| AuthError::Service(format!("read authorized_keys: {e}")))?;
     let authorized_keys = keys::parse_authorized_keys_str(&content);
     if authorized_keys.is_empty() {
-        debug!("No WebAuthn keys found in {}", config.key_file);
-        return Ok(false);
+        return Err(AuthError::InfoUnavailable(format!(
+            "no WebAuthn keys found in {}",
+            config.key_file
+        )));
     }
     info!(
         "Loaded {} WebAuthn key(s) from {}",
@@ -163,24 +249,27 @@ fn do_authenticate(config: &Config, handle: &mut PamHandle) -> Result<bool, Box<
     // that file's integrity, not this socket path.
     let socket_path = match &config.socket_path {
         Some(path) => path.clone(),
-        None => std::env::var("SSH_AUTH_SOCK")
-            .map_err(|_| "SSH_AUTH_SOCK not set")?,
+        None => std::env::var("SSH_AUTH_SOCK").map_err(|_| {
+            AuthError::InfoUnavailable("SSH_AUTH_SOCK not set".into())
+        })?,
     };
     let socket = Path::new(&socket_path);
 
     // List agent identities
-    let agent_identities = agent::list_webauthn_identities(socket)?;
+    let agent_identities = agent::list_webauthn_identities(socket)
+        .map_err(|e| classify_io_err(e, "list agent identities"))?;
     if agent_identities.is_empty() {
-        debug!("No WebAuthn keys in agent");
-        return Ok(false);
+        return Err(AuthError::InfoUnavailable(
+            "no WebAuthn keys in agent".into(),
+        ));
     }
     info!("Found {} WebAuthn key(s) in agent", agent_identities.len());
 
     // Iterate every (agent identity × authorized key) match and try them in
-    // order. A failure on one key (user denied the prompt, signature invalid,
-    // agent returned SSH_AGENT_FAILURE, etc.) is logged and skipped — only an
-    // empty match set or all-keys-failed produces Ok(false). Mirrors standard
-    // ssh-client behavior of trying each available identity.
+    // order. A soft failure on one key (user denied the prompt, signature
+    // invalid, agent returned SSH_AGENT_FAILURE) is logged and skipped — only
+    // a transport/protocol failure or all-matches-exhausted produces an Err.
+    // Mirrors standard ssh-client behavior of trying each available identity.
     let mut tried = 0;
     for agent_id in &agent_identities {
         for auth_key in &authorized_keys {
@@ -193,56 +282,71 @@ fn do_authenticate(config: &Config, handle: &mut PamHandle) -> Result<bool, Box<
                 auth_key.comment, auth_key.application
             );
             match try_authenticate(socket, auth_key, &agent_id.key_blob) {
-                Ok(true) => return Ok(true),
-                Ok(false) => continue,
-                Err(e) => {
-                    // Distinguish protocol refusal (user denied, key not
-                    // loaded, agent policy) from transport errors (broken
-                    // socket, malformed reply). Only the former should move
-                    // on silently — transport problems need to surface so
-                    // "agent is down" doesn't look like "no key matched."
-                    if let Some(agent::SignError::Transport(_)) =
-                        e.downcast_ref::<agent::SignError>()
-                    {
-                        error!(
-                            "pam_ssh_agent_webauthn: transport error talking to agent for key '{}': {e}",
-                            auth_key.comment
-                        );
-                        return Err(e);
-                    }
+                Ok(()) => return Ok(()),
+                Err(TryAuthOutcome::Refused(msg)) => {
                     warn!(
-                        "pam_ssh_agent_webauthn: key '{}' failed, trying next: {e}",
+                        "pam_ssh_agent_webauthn: key '{}' refused, trying next: {msg}",
                         auth_key.comment
                     );
+                }
+                Err(TryAuthOutcome::VerifyFailed(msg)) => {
+                    warn!(
+                        "pam_ssh_agent_webauthn: key '{}' verification failed, trying next: {msg}",
+                        auth_key.comment
+                    );
+                }
+                Err(TryAuthOutcome::Transport(e)) => {
+                    return Err(classify_io_err(
+                        e,
+                        &format!("agent sign for key '{}'", auth_key.comment),
+                    ));
+                }
+                Err(TryAuthOutcome::Random(msg)) => {
+                    return Err(AuthError::Service(format!(
+                        "challenge generation: {msg}"
+                    )));
                 }
             }
         }
     }
 
     if tried == 0 {
-        debug!("No agent key matched authorized keys");
+        Err(AuthError::AuthFail(
+            "no agent key matched authorized_keys".into(),
+        ))
     } else {
-        info!("All {tried} matching key(s) failed to authenticate");
+        Err(AuthError::AuthFail(format!(
+            "all {tried} matching key(s) failed to authenticate"
+        )))
     }
-    Ok(false)
 }
 
 fn try_authenticate(
     socket: &Path,
     key: &keys::WebAuthnPublicKey,
     key_blob: &[u8],
-) -> Result<bool, Box<dyn std::error::Error>> {
+) -> Result<(), TryAuthOutcome> {
     // Generate random challenge
     let mut challenge = [0u8; CHALLENGE_SIZE];
-    getrandom::fill(&mut challenge).map_err(|_| "Failed to generate random challenge")?;
+    getrandom::fill(&mut challenge)
+        .map_err(|e| TryAuthOutcome::Random(e.to_string()))?;
 
     // Sign via agent
-    let raw_sig = agent::sign_raw(socket, key_blob, &challenge)?;
+    let raw_sig = match agent::sign_raw(socket, key_blob, &challenge) {
+        Ok(sig) => sig,
+        Err(agent::SignError::Refused(msg)) => {
+            return Err(TryAuthOutcome::Refused(msg));
+        }
+        Err(agent::SignError::Transport(e)) => {
+            return Err(TryAuthOutcome::Transport(e));
+        }
+    };
 
     // Verify WebAuthn signature
-    webauthn::verify_webauthn_sk(key, &challenge, &raw_sig)?;
+    webauthn::verify_webauthn_sk(key, &challenge, &raw_sig)
+        .map_err(|e| TryAuthOutcome::VerifyFailed(e.to_string()))?;
 
-    Ok(true)
+    Ok(())
 }
 
 fn init_logging() {
@@ -290,16 +394,10 @@ pub fn authenticate(
                 continue;
             }
             match try_authenticate(socket_path, auth_key, &agent_id.key_blob) {
-                Ok(true) => return Ok(true),
-                Ok(false) => continue,
-                Err(e) => {
-                    if let Some(agent::SignError::Transport(_)) =
-                        e.downcast_ref::<agent::SignError>()
-                    {
-                        return Err(e);
-                    }
-                    continue;
-                }
+                Ok(()) => return Ok(true),
+                Err(TryAuthOutcome::Transport(e)) => return Err(Box::new(e)),
+                Err(TryAuthOutcome::Random(msg)) => return Err(msg.into()),
+                Err(TryAuthOutcome::Refused(_)) | Err(TryAuthOutcome::VerifyFailed(_)) => continue,
             }
         }
     }
@@ -351,5 +449,52 @@ mod tests {
     fn parse_args_rejects_invalid_strict_modes_value() {
         let err = parse(&["strict_modes=maybe"]).unwrap_err();
         assert!(err.contains("strict_modes"), "got: {err}");
+    }
+
+    #[test]
+    fn auth_error_pam_codes() {
+        assert_eq!(
+            AuthError::Service("x".into()).pam_code(),
+            PamResultCode::PAM_SERVICE_ERR
+        );
+        assert_eq!(
+            AuthError::InfoUnavailable("x".into()).pam_code(),
+            PamResultCode::PAM_AUTHINFO_UNAVAIL
+        );
+        assert_eq!(
+            AuthError::AuthFail("x".into()).pam_code(),
+            PamResultCode::PAM_AUTH_ERR
+        );
+        assert_eq!(
+            AuthError::UserUnknown.pam_code(),
+            PamResultCode::PAM_USER_UNKNOWN
+        );
+    }
+
+    #[test]
+    fn classify_io_err_routes_invalid_data_to_service() {
+        let e = io::Error::new(io::ErrorKind::InvalidData, "bad");
+        assert!(matches!(
+            classify_io_err(e, "ctx"),
+            AuthError::Service(_)
+        ));
+    }
+
+    #[test]
+    fn classify_io_err_routes_other_kinds_to_info_unavailable() {
+        for kind in [
+            io::ErrorKind::NotFound,
+            io::ErrorKind::PermissionDenied,
+            io::ErrorKind::ConnectionRefused,
+            io::ErrorKind::BrokenPipe,
+            io::ErrorKind::TimedOut,
+            io::ErrorKind::UnexpectedEof,
+        ] {
+            let e = io::Error::new(kind, "x");
+            assert!(
+                matches!(classify_io_err(e, "ctx"), AuthError::InfoUnavailable(_)),
+                "kind {kind:?} should map to InfoUnavailable"
+            );
+        }
     }
 }
