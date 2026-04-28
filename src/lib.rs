@@ -151,6 +151,24 @@ fn classify_io_err(e: io::Error, ctx: &str) -> AuthError {
     }
 }
 
+/// Classify an `authfile::OpenError` into an `AuthError`.
+///
+/// Most variants represent genuine misconfigurations (file owned by the
+/// wrong user, world-writable, on a per-user mount point, etc.) and map to
+/// `Service`. `Io` is delegated to `classify_io_err` so that benign cases
+/// like `NotFound` (host has not been provisioned with any keys yet) and
+/// `PermissionDenied` (e.g. an SELinux policy blocking the read) map to
+/// `InfoUnavailable` and let PAM stacks compose with `default=ignore` /
+/// `authinfo_unavail=ignore` cleanly. Without this, a missing
+/// `authorized_keys` file would be a hard lockout under the README's
+/// recommended stack.
+fn classify_open_err(e: authfile::OpenError) -> AuthError {
+    match e {
+        authfile::OpenError::Io(io_err) => classify_io_err(io_err, "read authorized_keys"),
+        other => AuthError::Service(format!("read authorized_keys: {other}")),
+    }
+}
+
 #[derive(Debug)]
 struct Config {
     key_file: String,
@@ -222,9 +240,12 @@ fn do_authenticate(config: &Config, handle: &mut PamHandle) -> Result<(), AuthEr
         ..Default::default()
     };
     let content = authfile::open_secure(Path::new(&config.key_file), &opts)
-        .map_err(|e| AuthError::Service(format!("read authorized_keys: {e}")))?;
+        .map_err(classify_open_err)?;
     let authorized_keys = keys::parse_authorized_keys_str(&content);
     if authorized_keys.is_empty() {
+        // The file exists, passed all safety checks, but contains no WebAuthn
+        // SK lines. Treat this the same as the file not existing at all:
+        // there is no credential to verify against, but the module is fine.
         return Err(AuthError::InfoUnavailable(format!(
             "no WebAuthn keys found in {}",
             config.key_file
@@ -255,7 +276,12 @@ fn do_authenticate(config: &Config, handle: &mut PamHandle) -> Result<(), AuthEr
     };
     let socket = Path::new(&socket_path);
 
-    // List agent identities
+    // List agent identities. An empty list is `InfoUnavailable` (the user
+    // has not loaded their credential into ssh-agent — fall through cleanly)
+    // rather than `AuthFail`. The asymmetry with the `tried == 0` case below
+    // is deliberate: "no keys at all" is a missing precondition, while "keys
+    // present but none match the authorized set" is a real authentication
+    // failure ("you have the wrong credential for this server").
     let agent_identities = agent::list_webauthn_identities(socket)
         .map_err(|e| classify_io_err(e, "list agent identities"))?;
     if agent_identities.is_empty() {
@@ -310,6 +336,10 @@ fn do_authenticate(config: &Config, handle: &mut PamHandle) -> Result<(), AuthEr
         }
     }
 
+    // Both branches are AuthFail: the agent presented WebAuthn keys but the
+    // user could not (or chose not to) prove possession of one that's listed
+    // in authorized_keys. Contrast with the empty-agent_identities branch
+    // above, which is InfoUnavailable.
     if tried == 0 {
         Err(AuthError::AuthFail(
             "no agent key matched authorized_keys".into(),
@@ -496,5 +526,73 @@ mod tests {
                 "kind {kind:?} should map to InfoUnavailable"
             );
         }
+    }
+
+    #[test]
+    fn classify_io_err_routes_agent_failure_to_info_unavailable() {
+        // `agent::list_webauthn_identities` wraps SSH_AGENT_FAILURE responses
+        // as `io::Error::other("Agent failure")`, which produces an error
+        // whose kind is implementation-defined (currently `Uncategorized`).
+        // Pin the contract so that classification doesn't accidentally land
+        // such errors in `Service`: a malfunctioning agent should let PAM
+        // stacks fall through, not lock the user out.
+        let e = io::Error::other("Agent failure");
+        assert!(
+            matches!(classify_io_err(e, "ctx"), AuthError::InfoUnavailable(_)),
+            "io::Error::other must classify as InfoUnavailable"
+        );
+    }
+
+    #[test]
+    fn classify_open_err_missing_file_is_info_unavailable() {
+        // Regression: a host with no /etc/security/authorized_keys yet
+        // (typical fresh install before any users are enrolled) must NOT
+        // produce PAM_SERVICE_ERR — that would turn the README's
+        // recommended stack into a hard lockout. NotFound and
+        // PermissionDenied both fall through to InfoUnavailable.
+        for kind in [io::ErrorKind::NotFound, io::ErrorKind::PermissionDenied] {
+            let err = authfile::OpenError::Io(io::Error::new(kind, "x"));
+            assert!(
+                matches!(classify_open_err(err), AuthError::InfoUnavailable(_)),
+                "OpenError::Io({kind:?}) should map to InfoUnavailable"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_open_err_misconfig_variants_are_service() {
+        use std::path::PathBuf;
+        let cases: Vec<authfile::OpenError> = vec![
+            authfile::OpenError::NotAbsolute(PathBuf::from("rel")),
+            authfile::OpenError::UnderUserWritableRoot {
+                path: PathBuf::from("/tmp/x"),
+                root: "/tmp/",
+            },
+            authfile::OpenError::NotRegularFile(PathBuf::from("/x")),
+            authfile::OpenError::BadOwner {
+                path: PathBuf::from("/x"),
+                actual: 1000,
+                expected: 0,
+            },
+            authfile::OpenError::BadMode {
+                path: PathBuf::from("/x"),
+                mode: 0o664,
+            },
+        ];
+        for err in cases {
+            let label = format!("{err:?}");
+            assert!(
+                matches!(classify_open_err(err), AuthError::Service(_)),
+                "{label} should map to Service"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_open_err_invalid_data_io_is_service() {
+        // E.g. canonicalize hitting a corrupted symlink chain on a broken
+        // filesystem — that's a Service-level concern, not info-missing.
+        let err = authfile::OpenError::Io(io::Error::new(io::ErrorKind::InvalidData, "x"));
+        assert!(matches!(classify_open_err(err), AuthError::Service(_)));
     }
 }

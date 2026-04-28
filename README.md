@@ -144,12 +144,12 @@ The module distinguishes failure modes so PAM stacks can route on them:
 This lets you compose stacks like:
 
 ```
-auth [success=ok auth_err=die authinfo_unavail=ignore default=die] \
+auth [success=done auth_err=die authinfo_unavail=ignore default=ignore] \
      pam_ssh_agent_webauthn.so
 auth requisite pam_unix.so
 ```
 
-— "if WebAuthn auth succeeded, accept; if the user actively failed, deny; if the user has no agent forwarded, fall through to passwords."
+— "if WebAuthn auth succeeded, accept and stop (`success=done`); if the user actively failed, deny; if the user has no agent forwarded or no keys configured, fall through to passwords."
 
 ### 4. Preserve SSH_AUTH_SOCK for sudo
 
