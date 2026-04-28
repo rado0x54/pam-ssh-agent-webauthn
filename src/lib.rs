@@ -88,6 +88,7 @@ impl PamHooks for PamSshWebauthn {
     }
 }
 
+#[derive(Debug)]
 struct Config {
     key_file: String,
     socket_path: Option<String>,
@@ -111,6 +112,11 @@ fn parse_args(args: &[&CStr]) -> Result<Config, String> {
                 "no" | "false" | "0" => false,
                 other => return Err(format!("Invalid strict_modes value: {other}")),
             };
+        } else {
+            // Refuse unknown args rather than silently dropping them: a typo
+            // like `strictmodes=no` instead of `strict_modes=no` would
+            // otherwise leave the user thinking they had disabled a check.
+            return Err(format!("Unknown argument: {s}"));
         }
     }
 
@@ -248,7 +254,19 @@ fn init_logging() {
     );
 }
 
-/// Standalone authentication function for testing and CLI usage.
+/// Standalone authentication helper for the bundled examples and integration
+/// tests. **Not for production use.**
+///
+/// This function reads `key_file` directly with `fs::read_to_string` — it
+/// **bypasses** the OpenSSH-style safety ladder applied by the PAM hook
+/// (`authfile::open_secure`). That is deliberate: the integration tests use
+/// scratch paths under `/tmp` that the ladder rejects on purpose. The PAM
+/// entry point (`sm_authenticate`) is the only path that should ever run as
+/// root, and it always goes through `open_secure`.
+///
+/// If you are embedding this crate outside the PAM hook, do not call this
+/// function with attacker-influenceable paths. Use [`authfile::open_secure`]
+/// + [`keys::parse_authorized_keys_str`] yourself.
 pub fn authenticate(
     socket_path: &Path,
     key_file: &Path,
@@ -287,4 +305,51 @@ pub fn authenticate(
     }
 
     Ok(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::CString;
+
+    fn cstrs(args: &[&str]) -> Vec<CString> {
+        args.iter().map(|s| CString::new(*s).unwrap()).collect()
+    }
+
+    fn parse(args: &[&str]) -> Result<Config, String> {
+        let owned = cstrs(args);
+        let refs: Vec<&CStr> = owned.iter().map(|c| c.as_c_str()).collect();
+        parse_args(&refs)
+    }
+
+    #[test]
+    fn parse_args_defaults() {
+        let cfg = parse(&[]).unwrap();
+        assert_eq!(cfg.key_file, DEFAULT_KEY_FILE);
+        assert!(cfg.socket_path.is_none());
+        assert!(cfg.strict_modes);
+    }
+
+    #[test]
+    fn parse_args_known_keys() {
+        let cfg = parse(&["file=/x", "socket=/y", "strict_modes=no"]).unwrap();
+        assert_eq!(cfg.key_file, "/x");
+        assert_eq!(cfg.socket_path.as_deref(), Some("/y"));
+        assert!(!cfg.strict_modes);
+    }
+
+    #[test]
+    fn parse_args_rejects_unknown_arg() {
+        // Common typos must be rejected, not silently dropped.
+        for bad in ["strictmodes=no", "strict-modes=no", "strict_mode=no", "garbage"] {
+            let err = parse(&[bad]).expect_err(&format!("expected error for {bad}"));
+            assert!(err.contains("Unknown argument"), "wrong error for {bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn parse_args_rejects_invalid_strict_modes_value() {
+        let err = parse(&["strict_modes=maybe"]).unwrap_err();
+        assert!(err.contains("strict_modes"), "got: {err}");
+    }
 }

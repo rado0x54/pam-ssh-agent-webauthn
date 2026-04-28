@@ -33,8 +33,22 @@ use std::path::{Path, PathBuf};
 /// these indicates a Model 2 (per-user) deployment, which this module does not
 /// support — the necessary `seteuid` machinery is not implemented and the file
 /// would be readable+writable by a non-root user.
-pub const DEFAULT_FORBIDDEN_ROOTS: &[&str] =
-    &["/home/", "/tmp/", "/var/tmp/", "/run/user/", "/Users/"];
+///
+/// Both the configured path AND its post-canonicalize form are checked, so the
+/// `/private/...` entries are needed for macOS where `/tmp`, `/var/tmp`, and
+/// `/var/folders` are symlinks: a configured `/etc/foo → /tmp/...` symlink
+/// would slip past the leaf check otherwise. The `/private/...` prefixes are
+/// harmless on Linux (no production deployment uses them).
+pub const DEFAULT_FORBIDDEN_ROOTS: &[&str] = &[
+    "/home/",
+    "/tmp/",
+    "/var/tmp/",
+    "/run/user/",
+    "/Users/",
+    "/private/tmp/",
+    "/private/var/tmp/",
+    "/private/var/folders/",
+];
 
 /// Configuration for [`open_secure`].
 #[derive(Debug, Clone)]
@@ -338,6 +352,31 @@ mod tests {
         match err {
             OpenError::UnderUserWritableRoot { root, .. } => assert_eq!(root, "/home/"),
             other => panic!("got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_macos_canonical_tmp_paths() {
+        // On macOS /tmp, /var/tmp, /var/folders are symlinks into /private/.
+        // Both the configured-path and post-canonicalize check must catch
+        // these forms — otherwise an intermediate-symlink config could slip
+        // past the leaf check.
+        let opts = Opts {
+            forbidden_roots: DEFAULT_FORBIDDEN_ROOTS,
+            ..test_opts()
+        };
+        for (path, expected_root) in [
+            ("/private/tmp/x/keys", "/private/tmp/"),
+            ("/private/var/tmp/x/keys", "/private/var/tmp/"),
+            ("/private/var/folders/ab/cd/keys", "/private/var/folders/"),
+        ] {
+            let err = open_secure(Path::new(path), &opts).unwrap_err();
+            match err {
+                OpenError::UnderUserWritableRoot { root, .. } => {
+                    assert_eq!(root, expected_root, "wrong root matched for {path}")
+                }
+                other => panic!("expected forbidden-root rejection for {path}, got {other:?}"),
+            }
         }
     }
 
