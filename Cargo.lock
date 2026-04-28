@@ -485,6 +485,7 @@ dependencies = [
  "base64",
  "env_logger",
  "getrandom 0.3.4",
+ "libc",
  "log",
  "openssl",
  "p256",
