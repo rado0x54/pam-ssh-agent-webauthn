@@ -339,8 +339,10 @@ fn do_authenticate(config: &Config, handle: &mut PamHandle) -> Result<(), AuthEr
             // A hostile agent advertising N>cap identities matching
             // authorized_keys would otherwise force N user-presence prompts;
             // record what we saw so operators can spot the pattern in syslog.
+            // Phrased to match the AuthFail message below so a single grep
+            // for `sign-attempt cap of {N} reached` finds both log lines.
             warn!(
-                "pam_ssh_agent_webauthn: sign-attempt cap reached: \
+                "pam_ssh_agent_webauthn: sign-attempt cap of {cap} reached: \
                  agent_identities={}, matched_pairs={}, attempts={}",
                 agent_identities.len(),
                 matched.len(),
@@ -542,6 +544,12 @@ pub fn authenticate_with_max_attempts(
     // See `do_authenticate` for the rationale behind iterating all matches.
     // Transport errors bubble up; protocol refusals / verification failures
     // fall through to the next match. Cap on attempts mirrors the PAM hook.
+    //
+    // Deliberately does NOT reuse `iter_attempts`: that helper emits the
+    // operator-facing WARN syslog line on cap hit, which is meaningful only
+    // in the PAM hook context (root, syslog wired up). If this helper is
+    // ever promoted out of `#[doc(hidden)]` to a supported API, switch to
+    // `iter_attempts` so embedders get the same observability.
     for (agent_id, auth_key) in matched.iter().take(max_attempts) {
         match try_authenticate(socket_path, auth_key, &agent_id.key_blob) {
             Ok(()) => return Ok(true),
@@ -593,6 +601,17 @@ mod tests {
         assert_eq!(cfg.max_attempts, 1);
         let cfg = parse(&["max_attempts=42"]).unwrap();
         assert_eq!(cfg.max_attempts, 42);
+    }
+
+    #[test]
+    fn parse_args_repeated_max_attempts_last_wins() {
+        // Pinning the silent-overwrite contract: if `max_attempts=` appears
+        // twice, the rightmost value wins (consistent with how `file=`,
+        // `socket=`, and `strict_modes=` already behave). Locks this in so
+        // a future change to "reject duplicates" doesn't break PAM stacks
+        // that rely on overlay-style arg composition.
+        let cfg = parse(&["max_attempts=1", "max_attempts=5"]).unwrap();
+        assert_eq!(cfg.max_attempts, 5);
     }
 
     #[test]
