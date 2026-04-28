@@ -66,7 +66,17 @@ impl PamHooks for PamSshWebauthn {
     }
 
     fn sm_setcred(_handle: &mut PamHandle, _args: Vec<&CStr>, _flags: PamFlag) -> PamResultCode {
-        // Required by doas — nothing to do
+        // This module performs authentication only; it issues no credential
+        // material (no Kerberos tickets, AFS tokens, session keyrings, etc.)
+        // and does not manage uid/gid context — that is the calling
+        // application's job. So sm_setcred is genuinely a no-op for us.
+        //
+        // The strictly-correct return for a no-op setcred would be PAM_IGNORE,
+        // but doas treats anything other than PAM_SUCCESS as failure and emits
+        // `doas: pam_setcred(?, PAM_REINITIALIZE_CRED): Permission denied`.
+        // Returning SUCCESS interoperates with sudo, login, sshd, and doas
+        // alike. Other auth-only modules (pam_google_authenticator, upstream
+        // pam-ssh-agent) make the same choice for the same reason.
         PamResultCode::PAM_SUCCESS
     }
 }
@@ -111,7 +121,17 @@ fn do_authenticate(config: &Config, handle: &mut PamHandle) -> Result<bool, Box<
         config.key_file
     );
 
-    // Get SSH_AUTH_SOCK from config override or environment
+    // Get SSH_AUTH_SOCK from config override or environment.
+    //
+    // Security note: this path is read from the unprivileged caller's
+    // environment without ownership/symlink/socket-type validation. That is
+    // intentional and matches OpenSSH's own behavior. The agent is only a
+    // signing oracle — it can produce signatures, but only with private keys
+    // it actually holds. Authorization is gated by the EC point + application
+    // pinned in `authorized_keys` (see `keys.rs`), so an attacker pointing
+    // this at a hostile agent cannot forge auth without already controlling a
+    // key listed in the (root-owned) authorized_keys file. The trust root is
+    // that file's integrity, not this socket path.
     let socket_path = match &config.socket_path {
         Some(path) => path.clone(),
         None => std::env::var("SSH_AUTH_SOCK")

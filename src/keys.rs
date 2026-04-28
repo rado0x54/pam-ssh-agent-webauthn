@@ -3,6 +3,29 @@
 //! Only handles `webauthn-sk-ecdsa-sha2-nistp256@openssh.com` keys.
 //! Extracts the EC point (P-256, uncompressed) and application string
 //! directly from the SSH wire format — no dependency on the ssh-key crate.
+//!
+//! ## Trust model
+//!
+//! `authorized_keys` is the trust root for this PAM module. Each line binds
+//! both the EC point AND the `application` (RP-ID) string into a single
+//! credential identity — both are pinned at the moment an admin writes the
+//! line. This is a property of the SK key format, not a runtime config:
+//!
+//! * A signature only verifies if the authenticator holds the private key
+//!   matching the EC point in the file, AND signs over `SHA256(application)`
+//!   from that same line. So a passkey registered for a different RP cannot
+//!   be repurposed: its `application` won't match, its EC point won't match,
+//!   or both.
+//! * Therefore there is no separate runtime "RP-ID allowlist" to configure.
+//!   Pinning happens at registration; the verifier just checks the math.
+//! * Likewise, the ssh-agent socket needs no validation — it is a signing
+//!   oracle that can only produce signatures with keys it actually holds, and
+//!   those won't satisfy this file unless they are already authorized.
+//!
+//! The single load-bearing protection is the integrity of the file itself
+//! (root-owned, not group/world-writable, ancestors likewise). Future audits
+//! that flag "no RP-ID pinning" or "no socket validation" as separate issues
+//! are misframing the threat model — both collapse into "protect this file."
 
 use base64::prelude::BASE64_STANDARD;
 use base64::Engine;
