@@ -182,12 +182,10 @@ fn matched_forbidden_root(
     path: &Path,
     forbidden_roots: &'static [&'static str],
 ) -> Option<&'static str> {
-    for root in forbidden_roots {
-        if path.starts_with(root) {
-            return Some(root);
-        }
-    }
-    None
+    forbidden_roots
+        .iter()
+        .copied()
+        .find(|root| path.starts_with(root))
 }
 
 #[cfg(test)]
