@@ -153,7 +153,7 @@ Two independent knobs control UV enforcement, both off by default:
   ```
   verify-required webauthn-sk-ecdsa-sha2-nistp256@openssh.com AAAA... user@host
   ```
-  The option may also appear inside a comma-separated options list (e.g. `cert-authority,verify-required …`), matching OpenSSH's `authorized_keys(5)` grammar.
+  Multiple options combine into a single comma-separated token before the algorithm, per OpenSSH's `authorized_keys(5)` grammar (e.g. `cert-authority,verify-required webauthn-sk-…`). Quoted values are honored (`from="a,b",verify-required …` — the comma inside `"…"` is part of the value, not an option separator). Only `verify-required` is acted on; other options (`cert-authority`, `command="…"`, `from="…"`, etc.) are tolerated but have no effect on this module.
 
 UV is enforced if **either** says so — whichever rule is stricter wins. With both off (the default), the UV bit is ignored, preserving compatibility with authenticators that do not support PIN/biometric prompts. When UV is required but the assertion lacks the bit, authentication fails with `PAM_AUTH_ERR`.
 

@@ -80,32 +80,45 @@ pub fn parse_authorized_keys_str(content: &str) -> Vec<WebAuthnPublicKey> {
 ///
 /// Format: `[options] webauthn-sk-ecdsa-sha2-nistp256@openssh.com <base64> [comment]`
 ///
-/// Options handling: only `verify-required` is recognised. Any other option
-/// tokens (`cert-authority`, `command="..."`, `from="..."`, etc.) are
-/// silently tolerated as today — they have no effect on this module. Options
-/// may appear as separate whitespace-delimited tokens or as a single
-/// comma-separated token, matching OpenSSH's authorized_keys(5) grammar.
+/// Tokenisation matches OpenSSH's `authorized_keys(5)` grammar (see
+/// `sshkey_advance_past_options` in OpenSSH `authfile.c`): the options
+/// block, if present, ends at the first **unquoted** whitespace, with `\"`
+/// recognised as the only escape inside `"..."`. This matters because
+/// option values can carry embedded spaces or commas (`command="ls -la"`,
+/// `from="a,b"`) which a naïve whitespace split would mishandle.
+///
+/// Of the recognised flag options, only `verify-required` is acted on; the
+/// rest (`cert-authority`, `command="..."`, `from="..."`, `principals=`,
+/// etc.) are silently tolerated as today. Lines whose options block is
+/// malformed (e.g. unterminated quote, multiple whitespace-separated tokens
+/// before the algorithm — not legal per OpenSSH) are skipped.
 fn parse_authorized_key_line(line: &str) -> Option<WebAuthnPublicKey> {
-    let parts: Vec<&str> = line.split_whitespace().collect();
+    let line = line.trim_start();
 
-    // Find the algorithm field
-    let algo_idx = parts.iter().position(|&p| p == WEBAUTHN_SK_ALGO)?;
-    let b64_idx = algo_idx + 1;
-    if b64_idx >= parts.len() {
-        log::debug!("No base64 data after algorithm in line");
+    // Either the line begins with the algorithm (no options) or with an
+    // options block followed by whitespace and then the algorithm.
+    let (options, after_options) = if line_starts_with_algo(line) {
+        ("", line)
+    } else {
+        let opts_end = advance_past_options(line)?;
+        (&line[..opts_end], line[opts_end..].trim_start())
+    };
+
+    let after_algo = after_options.strip_prefix(WEBAUTHN_SK_ALGO)?;
+    // The algorithm token must be terminated by whitespace (or end of
+    // line); otherwise we've matched a prefix of some other longer token.
+    if !matches!(
+        after_algo.as_bytes().first().copied(),
+        None | Some(b' ') | Some(b'\t')
+    ) {
         return None;
     }
 
-    // Scan the options field (everything before the algorithm token) for
-    // `verify-required`. OpenSSH option names are case-insensitive, and the
-    // canonical form packs them comma-separated into a single token, but
-    // some operators write them whitespace-separated — handle both.
-    let verify_required = parts[..algo_idx]
-        .iter()
-        .flat_map(|tok| tok.split(','))
-        .any(|opt| opt.trim().eq_ignore_ascii_case("verify-required"));
+    let mut rest = after_algo.split_whitespace();
+    let b64 = rest.next()?;
+    let comment = rest.collect::<Vec<_>>().join(" ");
 
-    let key_blob = match BASE64_STANDARD.decode(parts[b64_idx]) {
+    let key_blob = match BASE64_STANDARD.decode(b64) {
         Ok(blob) => blob,
         Err(e) => {
             log::debug!("Failed to decode base64 key: {e}");
@@ -113,11 +126,7 @@ fn parse_authorized_key_line(line: &str) -> Option<WebAuthnPublicKey> {
         }
     };
 
-    let comment = if b64_idx + 1 < parts.len() {
-        parts[b64_idx + 1..].join(" ")
-    } else {
-        String::new()
-    };
+    let verify_required = options_have_verify_required(options);
 
     match parse_webauthn_key_blob(&key_blob) {
         Some((ec_point, application)) => Some(WebAuthnPublicKey {
@@ -132,6 +141,90 @@ fn parse_authorized_key_line(line: &str) -> Option<WebAuthnPublicKey> {
             None
         }
     }
+}
+
+/// True iff `line` begins with the WebAuthn SK algorithm followed by
+/// whitespace or end-of-string. Lets the parser skip the options block
+/// entirely on lines that have no options, without mistaking the algorithm
+/// name for a prefix of some longer string.
+fn line_starts_with_algo(line: &str) -> bool {
+    line.strip_prefix(WEBAUTHN_SK_ALGO).is_some_and(|tail| {
+        matches!(
+            tail.as_bytes().first().copied(),
+            None | Some(b' ') | Some(b'\t')
+        )
+    })
+}
+
+/// Advance past an authorized_keys options block, mirroring OpenSSH's
+/// `sshkey_advance_past_options` (authfile.c:463): the block ends at the
+/// first **unquoted** whitespace, with `\"` as the only escape inside
+/// `"..."`. Returns the byte offset where the block ends, or `None` if
+/// quotes are unterminated.
+fn advance_past_options(s: &str) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    let mut quoted = false;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if !quoted && (b == b' ' || b == b'\t') {
+            return Some(i);
+        }
+        if b == b'\\' && bytes.get(i + 1).copied() == Some(b'"') {
+            i += 2;
+            continue;
+        }
+        if b == b'"' {
+            quoted = !quoted;
+        }
+        i += 1;
+    }
+    if quoted {
+        None
+    } else {
+        Some(i)
+    }
+}
+
+/// Returns true iff the comma-separated authorized_keys options block
+/// `opts` contains a `verify-required` flag option, with quote awareness
+/// per OpenSSH's `opt_dequote` (misc.c:2696): inside `"..."`, commas are
+/// literal and `\"` is the only escape. Option names are matched
+/// case-insensitively (`strncasecmp` in OpenSSH).
+///
+/// Quote awareness matters because an option like `from="a,verify-required,b"`
+/// embeds commas in its quoted value — a naïve `split(',')` would falsely
+/// pull `verify-required` out of that value.
+fn options_have_verify_required(opts: &str) -> bool {
+    let bytes = opts.as_bytes();
+    let mut start = 0;
+    let mut i = 0;
+    let mut quoted = false;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if quoted {
+            if b == b'\\' && bytes.get(i + 1).copied() == Some(b'"') {
+                i += 2;
+                continue;
+            }
+            if b == b'"' {
+                quoted = false;
+            }
+            i += 1;
+        } else if b == b'"' {
+            quoted = true;
+            i += 1;
+        } else if b == b',' {
+            if opts[start..i].eq_ignore_ascii_case("verify-required") {
+                return true;
+            }
+            i += 1;
+            start = i;
+        } else {
+            i += 1;
+        }
+    }
+    opts[start..].eq_ignore_ascii_case("verify-required")
 }
 
 /// Parse the wire format of a webauthn-sk-ecdsa key blob.
@@ -266,6 +359,77 @@ mod tests {
 
         let key = parse_authorized_key_line(&line).unwrap();
         assert!(!key.verify_required);
+    }
+
+    #[test]
+    fn test_parse_authorized_key_line_quoted_comma_is_not_a_separator() {
+        // OpenSSH's opt_dequote treats commas inside "..." as literal.
+        // A `from=` value carrying the literal substring "verify-required"
+        // between commas must NOT trigger UV enforcement — that comma is
+        // part of the value, not an option separator.
+        let blob = make_test_key_blob("localhost");
+        let b64 = BASE64_STANDARD.encode(&blob);
+        let line = format!(r#"from="a,verify-required,b" {WEBAUTHN_SK_ALGO} {b64}"#);
+
+        let key = parse_authorized_key_line(&line).unwrap();
+        assert!(
+            !key.verify_required,
+            "comma inside quoted from= value must not be treated as an option separator"
+        );
+    }
+
+    #[test]
+    fn test_parse_authorized_key_line_quoted_space_in_option_value() {
+        // command="ls -la" carries a space inside the quoted value. The
+        // options block ends at the first UNQUOTED whitespace, so the
+        // algorithm token still parses correctly.
+        let blob = make_test_key_blob("localhost");
+        let b64 = BASE64_STANDARD.encode(&blob);
+        let line = format!(r#"command="ls -la",verify-required {WEBAUTHN_SK_ALGO} {b64} c"#);
+
+        let key = parse_authorized_key_line(&line).unwrap();
+        assert!(key.verify_required);
+        assert_eq!(key.comment, "c");
+    }
+
+    #[test]
+    fn test_parse_authorized_key_line_rejects_whitespace_separated_options() {
+        // OpenSSH's authorized_keys grammar requires options to be a single
+        // comma-separated token; whitespace ENDS the options block. So
+        // `verify-required cert-authority webauthn-sk-...` is malformed —
+        // OpenSSH would treat `verify-required` as the entire options
+        // block and then try to parse `cert-authority` as the algorithm,
+        // failing. Match that — skip the line cleanly instead of silently
+        // honouring a non-canonical form.
+        let blob = make_test_key_blob("localhost");
+        let b64 = BASE64_STANDARD.encode(&blob);
+        let line = format!("verify-required cert-authority {WEBAUTHN_SK_ALGO} {b64}");
+
+        assert!(parse_authorized_key_line(&line).is_none());
+    }
+
+    #[test]
+    fn test_parse_authorized_key_line_rejects_unterminated_quote() {
+        // A line with an unterminated quote in its options block is
+        // malformed; advance_past_options returns None and we skip the line.
+        let blob = make_test_key_blob("localhost");
+        let b64 = BASE64_STANDARD.encode(&blob);
+        let line = format!(r#"from="oops {WEBAUTHN_SK_ALGO} {b64}"#);
+
+        assert!(parse_authorized_key_line(&line).is_none());
+    }
+
+    #[test]
+    fn test_parse_authorized_key_line_escaped_quote_inside_value() {
+        // \" inside "..." is the only recognised escape per opt_dequote;
+        // the embedded quote must not toggle quoted state. Comma-after-
+        // closing-quote splits the option list normally.
+        let blob = make_test_key_blob("localhost");
+        let b64 = BASE64_STANDARD.encode(&blob);
+        let line = format!(r#"command="echo \"hi\"",verify-required {WEBAUTHN_SK_ALGO} {b64}"#);
+
+        let key = parse_authorized_key_line(&line).unwrap();
+        assert!(key.verify_required);
     }
 
     #[test]

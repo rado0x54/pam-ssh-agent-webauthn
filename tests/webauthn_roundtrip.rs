@@ -41,9 +41,20 @@ fn make_webauthn_key_blob(signing_key: &SigningKey) -> Vec<u8> {
     blob
 }
 
-/// Build a WebAuthn-style SSH signature blob.
+/// Build a WebAuthn-style SSH signature blob with the default flags
+/// (UP + UV set). Convenience wrapper over [`build_webauthn_signature_with_flags`].
 fn build_webauthn_signature(signing_key: &SigningKey, challenge: &[u8]) -> Vec<u8> {
-    let flags: u8 = 0x05; // UP + UV
+    build_webauthn_signature_with_flags(signing_key, challenge, 0x05)
+}
+
+/// Build a WebAuthn-style SSH signature blob with explicit authenticator
+/// flags. Used by the UV-enforcement tests to produce a UP-only (no UV)
+/// signature without disturbing the other tests' assumptions.
+fn build_webauthn_signature_with_flags(
+    signing_key: &SigningKey,
+    challenge: &[u8],
+    flags: u8,
+) -> Vec<u8> {
     let counter: u32 = 42;
 
     let challenge_b64 = URL_SAFE_NO_PAD.encode(challenge);
@@ -721,4 +732,194 @@ fn test_cap_blocks_otherwise_succeeding_key() {
         observed, 1,
         "cap=1 must stop iteration after 1 sign request even though the second key would have signed; got {observed}"
     );
+}
+
+/// Mock agent that signs every request with `signing_flags` (typically
+/// 0x01 — UP only, no UV). Used to drive the UV-enforcement tests:
+/// regardless of what the policy demands, this agent never asserts UV.
+fn run_fixed_flags_agent(
+    listener: UnixListener,
+    signing_key: SigningKey,
+    key_blob: Vec<u8>,
+    signing_flags: u8,
+    sign_count: Arc<std::sync::atomic::AtomicUsize>,
+    stop: Arc<AtomicBool>,
+) {
+    listener
+        .set_nonblocking(true)
+        .expect("set_nonblocking failed");
+
+    while !stop.load(Ordering::Relaxed) {
+        match listener.accept() {
+            Ok((mut stream, _)) => {
+                stream.set_nonblocking(false).unwrap();
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap();
+
+                let mut len_buf = [0u8; 4];
+                if stream.read_exact(&mut len_buf).is_err() {
+                    continue;
+                }
+                let msg_len = u32::from_be_bytes(len_buf) as usize;
+                let mut msg = vec![0u8; msg_len];
+                if stream.read_exact(&mut msg).is_err() {
+                    continue;
+                }
+
+                match msg[0] {
+                    SSH_AGENTC_REQUEST_IDENTITIES => {
+                        let mut response = Vec::new();
+                        response.push(SSH_AGENT_IDENTITIES_ANSWER);
+                        response.extend(&1u32.to_be_bytes());
+                        write_ssh_string(&mut response, &key_blob);
+                        write_ssh_string(&mut response, b"uv-test-key");
+
+                        let len = (response.len() as u32).to_be_bytes();
+                        stream.write_all(&len).unwrap();
+                        stream.write_all(&response).unwrap();
+                        stream.flush().unwrap();
+                    }
+                    SSH_AGENTC_SIGN_REQUEST => {
+                        sign_count.fetch_add(1, Ordering::Relaxed);
+                        let mut reader: &[u8] = &msg[1..];
+                        let _key = read_ssh_bytes(&mut reader);
+                        let data = read_ssh_bytes(&mut reader).unwrap_or(b"");
+                        let sig_blob = build_webauthn_signature_with_flags(
+                            &signing_key,
+                            data,
+                            signing_flags,
+                        );
+
+                        let mut response = Vec::new();
+                        response.push(SSH_AGENT_SIGN_RESPONSE);
+                        write_ssh_string(&mut response, &sig_blob);
+
+                        let len = (response.len() as u32).to_be_bytes();
+                        stream.write_all(&len).unwrap();
+                        stream.write_all(&response).unwrap();
+                        stream.flush().unwrap();
+                    }
+                    _ => {}
+                }
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(_) => break,
+        }
+    }
+}
+
+/// Builds the scaffolding for a UV-enforcement test: an agent that signs
+/// with `signing_flags`, plus an `authorized_keys` file written from
+/// `key_options` (the leading options block, comma-separated, OpenSSH-
+/// canonical form — empty string for "no options"). Returns the paths,
+/// the sign-count, and the join handle.
+fn setup_uv_test(
+    signing_flags: u8,
+    key_options: &str,
+) -> (
+    PathBuf,
+    PathBuf,
+    Arc<std::sync::atomic::AtomicUsize>,
+    Arc<AtomicBool>,
+    std::thread::JoinHandle<()>,
+) {
+    let id = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+
+    let signing_key = SigningKey::from_bytes(&TEST_KEY_BYTES.into()).unwrap();
+    let key_blob = make_webauthn_key_blob(&signing_key);
+
+    let key_file = std::env::temp_dir().join(format!(
+        "pam_webauthn_test_uv_keys_{}_{id}.pub",
+        std::process::id()
+    ));
+    let b64 = BASE64_STANDARD.encode(&key_blob);
+    let line = if key_options.is_empty() {
+        format!("{WEBAUTHN_SK_ALGO} {b64} uv-test-key\n")
+    } else {
+        format!("{key_options} {WEBAUTHN_SK_ALGO} {b64} uv-test-key\n")
+    };
+    std::fs::write(&key_file, &line).unwrap();
+
+    let socket_path = std::env::temp_dir().join(format!(
+        "pam_webauthn_test_uv_agent_{}_{id}.sock",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&socket_path);
+    let listener = UnixListener::bind(&socket_path).unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_clone = stop.clone();
+    let sign_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let sign_count_clone = sign_count.clone();
+    let key_blob_clone = key_blob.clone();
+
+    let thread = std::thread::spawn(move || {
+        run_fixed_flags_agent(
+            listener,
+            signing_key,
+            key_blob_clone,
+            signing_flags,
+            sign_count_clone,
+            stop_clone,
+        );
+    });
+    std::thread::sleep(std::time::Duration::from_millis(50));
+
+    (socket_path, key_file, sign_count, stop, thread)
+}
+
+#[test]
+fn test_uv_required_per_key_rejects_up_only_signature() {
+    // End-to-end UV enforcement: the agent signs with flags=0x01 (UP only,
+    // no UV bit). The authorized_keys line carries `verify-required`, so
+    // validate_flags must reject the assertion. The module treats this as
+    // "this key didn't authenticate" and exhausts matches → Ok(false).
+    // Locks in the OR-combine wiring at the integration level: the per-key
+    // option flows from authorized_keys → WebAuthnPublicKey.verify_required
+    // → try_authenticate's merged uv_required → validate_flags.
+    let (socket_path, key_file, sign_count, stop, thread) =
+        setup_uv_test(0x01, "verify-required");
+
+    let result = pam_ssh_agent_webauthn::authenticate(&socket_path, &key_file);
+    let observed = sign_count.load(Ordering::Relaxed);
+
+    stop.store(true, Ordering::Relaxed);
+    let _ = thread.join();
+    let _ = std::fs::remove_file(&socket_path);
+    let _ = std::fs::remove_file(&key_file);
+
+    assert!(
+        matches!(result, Ok(false)),
+        "expected Ok(false) when UV-required key meets a UP-only signature, got {result:?}"
+    );
+    assert_eq!(
+        observed, 1,
+        "agent should have been asked to sign exactly once before UV verification rejected the result"
+    );
+}
+
+#[test]
+fn test_uv_not_required_default_accepts_up_only_signature() {
+    // Positive control for the test above: same signature shape (UP only,
+    // no UV), but no `verify-required` option on the key. Default policy
+    // is permissive, so this MUST succeed. Without this control, the
+    // negative test alone wouldn't prove the UV bit was the cause of
+    // failure (could be agent setup, key blob mismatch, etc.).
+    let (socket_path, key_file, sign_count, stop, thread) = setup_uv_test(0x01, "");
+
+    let result = pam_ssh_agent_webauthn::authenticate(&socket_path, &key_file);
+    let observed = sign_count.load(Ordering::Relaxed);
+
+    stop.store(true, Ordering::Relaxed);
+    let _ = thread.join();
+    let _ = std::fs::remove_file(&socket_path);
+    let _ = std::fs::remove_file(&key_file);
+
+    assert!(
+        matches!(result, Ok(true)),
+        "default-permissive UV policy must accept a UP-only signature, got {result:?}"
+    );
+    assert_eq!(observed, 1);
 }
