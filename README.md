@@ -129,6 +129,28 @@ auth sufficient pam_ssh_agent_webauthn.so socket=/path/to/agent.sock
 auth sufficient pam_ssh_agent_webauthn.so strict_modes=no
 ```
 
+### PAM return codes
+
+The module distinguishes failure modes so PAM stacks can route on them:
+
+| Return code | Condition |
+|---|---|
+| `PAM_SUCCESS` | A matching key signed the challenge and the signature verified. |
+| `PAM_AUTH_ERR` | No agent key matched `authorized_keys`, or every matched key was refused / failed verification (user denied the touch, agent rejected, etc.). |
+| `PAM_AUTHINFO_UNAVAIL` | `SSH_AUTH_SOCK` not set, agent socket unreachable, agent advertises no WebAuthn keys, or `authorized_keys` is empty. The module is fine — the info needed to authenticate just isn't present. |
+| `PAM_SERVICE_ERR` | Module misconfiguration (bad arg, unreadable / unsafe `authorized_keys`), or the agent returned a malformed protocol message. |
+| `PAM_USER_UNKNOWN` | PAM did not supply a user identity. |
+
+This lets you compose stacks like:
+
+```
+auth [success=done auth_err=die authinfo_unavail=ignore default=ignore] \
+     pam_ssh_agent_webauthn.so
+auth requisite pam_unix.so
+```
+
+— "if WebAuthn auth succeeded, accept and stop (`success=done`); if the user actively failed, deny; if the user has no agent forwarded or no keys configured, fall through to passwords."
+
 ### 4. Preserve SSH_AUTH_SOCK for sudo
 
 ```bash
