@@ -64,11 +64,15 @@ impl PamHooks for PamSshWebauthn {
             }
             Err(e) => {
                 let code = e.pam_code();
-                // Service errors get error!; everything else is info!. The
-                // distinction matters because admins triaging a syslog stream
-                // should see broken-config / malformed-protocol issues
-                // separately from "user denied the touch."
-                if matches!(e, AuthError::Service(_)) {
+                // Service errors and UserUnknown get error!; everything else
+                // is info!. The distinction matters because admins triaging
+                // a syslog stream should see broken-config / malformed-
+                // protocol issues — and a calling app that failed to set
+                // PAM_USER before pam_authenticate (UserUnknown) is the same
+                // class of "module was called wrong" — separately from the
+                // expected "user denied the touch" / "no agent forwarded"
+                // events.
+                if matches!(e, AuthError::Service(_) | AuthError::UserUnknown) {
                     error!("pam_ssh_agent_webauthn: {e}");
                 } else {
                     info!("pam_ssh_agent_webauthn: {e}");
@@ -96,7 +100,7 @@ impl PamHooks for PamSshWebauthn {
 
 /// Categorizes auth failures by the PAM return code they should map to.
 /// The discrimination matters for PAM stacks composed with
-/// `[success=ok default=ignore]` and similar patterns: admins need to
+/// `[success=done default=ignore]` and similar patterns: admins need to
 /// distinguish "this module is broken" from "this user isn't authorized"
 /// from "this module needs information it doesn't have."
 #[derive(Debug)]
