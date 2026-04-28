@@ -285,6 +285,7 @@ fn run_skip_first_agent(
     fail_key_blob: Vec<u8>,
     succeed_signing_key: SigningKey,
     succeed_key_blob: Vec<u8>,
+    sign_count: Arc<std::sync::atomic::AtomicUsize>,
     stop: Arc<AtomicBool>,
 ) {
     listener.set_nonblocking(true).expect("set_nonblocking failed");
@@ -323,6 +324,7 @@ fn run_skip_first_agent(
                         stream.flush().unwrap();
                     }
                     SSH_AGENTC_SIGN_REQUEST => {
+                        sign_count.fetch_add(1, Ordering::Relaxed);
                         let mut reader: &[u8] = &msg[1..];
                         let requested_key = read_ssh_bytes(&mut reader).unwrap_or(b"");
                         let data = read_ssh_bytes(&mut reader).unwrap_or(b"");
@@ -393,8 +395,10 @@ fn test_skip_failing_key_then_succeed() {
 
     let fail_blob_clone = fail_blob.clone();
     let succeed_blob_clone = succeed_blob.clone();
+    let sign_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let sign_count_clone = sign_count.clone();
     let thread = std::thread::spawn(move || {
-        run_skip_first_agent(listener, fail_blob_clone, succeed_key, succeed_blob_clone, stop_clone);
+        run_skip_first_agent(listener, fail_blob_clone, succeed_key, succeed_blob_clone, sign_count_clone, stop_clone);
     });
     std::thread::sleep(std::time::Duration::from_millis(50));
 
@@ -406,6 +410,11 @@ fn test_skip_failing_key_then_succeed() {
     let _ = std::fs::remove_file(&key_file);
 
     assert!(matches!(result, Ok(true)), "expected Ok(true), got {result:?}");
+    assert_eq!(
+        sign_count.load(Ordering::Relaxed),
+        2,
+        "expected 2 sign requests (1 denied + 1 accepted)"
+    );
 }
 
 #[test]
@@ -622,8 +631,10 @@ fn test_cap_not_hit_when_match_succeeds_within_limit() {
 
     let fail_blob_clone = fail_blob.clone();
     let succeed_blob_clone = succeed_blob.clone();
+    let sign_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let sign_count_clone = sign_count.clone();
     let thread = std::thread::spawn(move || {
-        run_skip_first_agent(listener, fail_blob_clone, succeed_key, succeed_blob_clone, stop_clone);
+        run_skip_first_agent(listener, fail_blob_clone, succeed_key, succeed_blob_clone, sign_count_clone, stop_clone);
     });
     std::thread::sleep(std::time::Duration::from_millis(50));
 
@@ -639,4 +650,75 @@ fn test_cap_not_hit_when_match_succeeds_within_limit() {
     let _ = std::fs::remove_file(&key_file);
 
     assert!(matches!(result, Ok(true)), "expected Ok(true), got {result:?}");
+    assert_eq!(sign_count.load(Ordering::Relaxed), 2, "expected 2 sign requests");
+}
+
+#[test]
+fn test_cap_blocks_otherwise_succeeding_key() {
+    // Two matched keys: the first is denied (SSH_AGENT_FAILURE), the second
+    // *would* sign successfully if reached. With cap=1 the module must stop
+    // after the denied first attempt — proving the cap is doing security
+    // work (actively preventing an auth that would otherwise succeed) rather
+    // than just shortening iteration over already-failing keys.
+    //
+    // This is the pathological case the cap is designed for: a hostile agent
+    // controlling identity order can DoS a legitimate user at cap=1 by
+    // fronting a non-signing identity ahead of the real one. See the README
+    // caveat on raising the cap above 1 if this pattern shows up in syslog.
+    let id = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+
+    let fail_key = SigningKey::from_bytes(&TEST_KEY_BYTES.into()).unwrap();
+    let fail_blob = make_webauthn_key_blob(&fail_key);
+
+    let succeed_key_bytes: [u8; 32] = [
+        0xd1, 0xd2, 0xd3, 0xd4, 0xd5, 0xd6, 0xd7, 0xd8, 0xd9, 0xda, 0xdb, 0xdc, 0xdd, 0xde, 0xdf,
+        0xe0, 0xe1, 0xe2, 0xe3, 0xe4, 0xe5, 0xe6, 0xe7, 0xe8, 0xe9, 0xea, 0xeb, 0xec, 0xed, 0xee,
+        0xef, 0xf0,
+    ];
+    let succeed_key = SigningKey::from_bytes(&succeed_key_bytes.into()).unwrap();
+    let succeed_blob = make_webauthn_key_blob(&succeed_key);
+
+    let key_file = std::env::temp_dir().join(format!(
+        "pam_webauthn_test_cap_blocks_keys_{}_{id}.pub",
+        std::process::id()
+    ));
+    let line1 = format!("{WEBAUTHN_SK_ALGO} {} deny-key\n", BASE64_STANDARD.encode(&fail_blob));
+    let line2 = format!("{WEBAUTHN_SK_ALGO} {} allow-key\n", BASE64_STANDARD.encode(&succeed_blob));
+    std::fs::write(&key_file, format!("{line1}{line2}")).unwrap();
+
+    let socket_path = std::env::temp_dir().join(format!(
+        "pam_webauthn_test_cap_blocks_agent_{}_{id}.sock",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&socket_path);
+    let listener = UnixListener::bind(&socket_path).unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_clone = stop.clone();
+    let sign_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let sign_count_clone = sign_count.clone();
+
+    let fail_blob_clone = fail_blob.clone();
+    let succeed_blob_clone = succeed_blob.clone();
+    let thread = std::thread::spawn(move || {
+        run_skip_first_agent(listener, fail_blob_clone, succeed_key, succeed_blob_clone, sign_count_clone, stop_clone);
+    });
+    std::thread::sleep(std::time::Duration::from_millis(50));
+
+    let result = pam_ssh_agent_webauthn::authenticate_with_max_attempts(
+        &socket_path,
+        &key_file,
+        1,
+    );
+    let observed = sign_count.load(Ordering::Relaxed);
+
+    stop.store(true, Ordering::Relaxed);
+    let _ = thread.join();
+    let _ = std::fs::remove_file(&socket_path);
+    let _ = std::fs::remove_file(&key_file);
+
+    assert!(matches!(result, Ok(false)), "expected Ok(false), got {result:?}");
+    assert_eq!(
+        observed, 1,
+        "cap=1 must stop iteration after 1 sign request even though the second key would have signed; got {observed}"
+    );
 }

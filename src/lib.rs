@@ -324,15 +324,7 @@ fn do_authenticate(config: &Config, handle: &mut PamHandle) -> Result<(), AuthEr
     // match count when the cap is hit. Both inputs are bounded (the agent
     // wire format caps the IDENTITIES_ANSWER message at 1 MiB, and
     // authorized_keys is a root-owned file), so this allocation is small.
-    let matched: Vec<(&agent::AgentIdentity, &keys::WebAuthnPublicKey)> = agent_identities
-        .iter()
-        .flat_map(|aid| {
-            authorized_keys
-                .iter()
-                .filter(move |ak| ak.key_blob == aid.key_blob)
-                .map(move |ak| (aid, ak))
-        })
-        .collect();
+    let matched = matched_pairs(&agent_identities, &authorized_keys);
 
     // Iterate matches in order, capped at config.max_attempts. A soft failure
     // on one key (user denied the prompt, signature invalid, agent returned
@@ -341,54 +333,71 @@ fn do_authenticate(config: &Config, handle: &mut PamHandle) -> Result<(), AuthEr
     // Mirrors standard ssh-client behavior of trying each available identity,
     // with a cap analogous to OpenSSH's MaxAuthTries.
     let cap = config.max_attempts;
-    let attempts = iter_attempts(socket, &matched, cap)?;
-
-    if attempts.succeeded {
-        return Ok(());
-    }
-
-    if attempts.hit_cap {
-        // A hostile agent advertising N>cap identities matching authorized_keys
-        // would otherwise force N user-presence prompts; record what we saw so
-        // operators can spot the pattern in syslog.
-        warn!(
-            "pam_ssh_agent_webauthn: sign-attempt cap reached: \
-             agent_identities={}, matched_pairs={}, attempts={}",
-            agent_identities.len(),
-            matched.len(),
-            attempts.tried
-        );
-        return Err(AuthError::AuthFail(format!(
-            "sign-attempt cap of {cap} reached; {} match(es) advertised",
-            matched.len()
-        )));
-    }
-
-    // Both branches are AuthFail: the agent presented WebAuthn keys but the
-    // user could not (or chose not to) prove possession of one that's listed
-    // in authorized_keys. Contrast with the empty-agent_identities branch
-    // above, which is InfoUnavailable.
-    if attempts.tried == 0 {
-        Err(AuthError::AuthFail(
+    match iter_attempts(socket, &matched, cap)? {
+        AttemptOutcome::Succeeded => Ok(()),
+        AttemptOutcome::CapHit { tried } => {
+            // A hostile agent advertising N>cap identities matching
+            // authorized_keys would otherwise force N user-presence prompts;
+            // record what we saw so operators can spot the pattern in syslog.
+            warn!(
+                "pam_ssh_agent_webauthn: sign-attempt cap reached: \
+                 agent_identities={}, matched_pairs={}, attempts={}",
+                agent_identities.len(),
+                matched.len(),
+                tried
+            );
+            Err(AuthError::AuthFail(format!(
+                "sign-attempt cap of {cap} reached; tried {tried} of {} match(es)",
+                matched.len()
+            )))
+        }
+        // Both branches are AuthFail: the agent presented WebAuthn keys but
+        // the user could not (or chose not to) prove possession of one that's
+        // listed in authorized_keys. Contrast with the empty-agent_identities
+        // branch above, which is InfoUnavailable.
+        AttemptOutcome::Exhausted { tried: 0 } => Err(AuthError::AuthFail(
             "no agent key matched authorized_keys".into(),
-        ))
-    } else {
-        Err(AuthError::AuthFail(format!(
-            "all {} matching key(s) failed to authenticate",
-            attempts.tried
-        )))
+        )),
+        AttemptOutcome::Exhausted { tried } => Err(AuthError::AuthFail(format!(
+            "all {tried} matching key(s) failed to authenticate"
+        ))),
     }
 }
 
-/// Result of iterating matched (agent ↔ authorized_keys) pairs up to a cap.
-struct AttemptOutcome {
-    /// Whether one of the attempts produced a verified signature.
-    succeeded: bool,
-    /// Number of sign requests actually issued to the agent.
-    tried: usize,
-    /// True if iteration stopped because the cap was reached, not because
-    /// matches were exhausted or one succeeded.
-    hit_cap: bool,
+/// Build the cartesian product of (agent identity × authorized key) pairs
+/// whose key blobs match exactly. Centralized so both the PAM hook path and
+/// the bundled `authenticate` helper apply the same matching rule —
+/// canonicalization changes (e.g. application-string normalization) only
+/// need updating in one place.
+fn matched_pairs<'a>(
+    agent_identities: &'a [agent::AgentIdentity],
+    authorized_keys: &'a [keys::WebAuthnPublicKey],
+) -> Vec<(&'a agent::AgentIdentity, &'a keys::WebAuthnPublicKey)> {
+    agent_identities
+        .iter()
+        .flat_map(|aid| {
+            authorized_keys
+                .iter()
+                .filter(move |ak| ak.key_blob == aid.key_blob)
+                .map(move |ak| (aid, ak))
+        })
+        .collect()
+}
+
+/// Outcome of iterating matched (agent ↔ authorized_keys) pairs up to a cap.
+/// Encoded as an enum so the three terminal states (signed, cap reached,
+/// matches exhausted) are mutually exclusive at the type level — the call
+/// site reads as an exhaustive `match` rather than two sequential `if`s.
+enum AttemptOutcome {
+    /// One of the attempts produced a verified signature. The attempt count
+    /// is not carried — the caller's only job on success is to return
+    /// `PAM_SUCCESS` / `Ok(true)`, and no log message currently consumes it.
+    Succeeded,
+    /// Iteration stopped because the cap was reached before all matches
+    /// could be tried.
+    CapHit { tried: usize },
+    /// Every available match was tried (or there were none); none succeeded.
+    Exhausted { tried: usize },
 }
 
 /// Iterate matched pairs, sending sign requests until one succeeds, the cap
@@ -402,11 +411,7 @@ fn iter_attempts(
     let mut tried = 0;
     for (agent_id, auth_key) in matched.iter() {
         if tried >= cap {
-            return Ok(AttemptOutcome {
-                succeeded: false,
-                tried,
-                hit_cap: true,
-            });
+            return Ok(AttemptOutcome::CapHit { tried });
         }
         tried += 1;
         debug!(
@@ -414,13 +419,7 @@ fn iter_attempts(
             auth_key.comment, auth_key.application
         );
         match try_authenticate(socket, auth_key, &agent_id.key_blob) {
-            Ok(()) => {
-                return Ok(AttemptOutcome {
-                    succeeded: true,
-                    tried,
-                    hit_cap: false,
-                });
-            }
+            Ok(()) => return Ok(AttemptOutcome::Succeeded),
             Err(TryAuthOutcome::Refused(msg)) => {
                 warn!(
                     "pam_ssh_agent_webauthn: key '{}' refused, trying next: {msg}",
@@ -446,11 +445,7 @@ fn iter_attempts(
             }
         }
     }
-    Ok(AttemptOutcome {
-        succeeded: false,
-        tried,
-        hit_cap: false,
-    })
+    Ok(AttemptOutcome::Exhausted { tried })
 }
 
 fn try_authenticate(
@@ -503,6 +498,10 @@ fn init_logging() {
 /// If you are embedding this crate outside the PAM hook, do not call this
 /// function with attacker-influenceable paths. Use [`authfile::open_secure`]
 /// + [`keys::parse_authorized_keys_str`] yourself.
+///
+/// `#[doc(hidden)]`: kept `pub` for the bundled examples and `tests/`
+/// integration crate, but not part of the supported API surface.
+#[doc(hidden)]
 pub fn authenticate(
     socket_path: &Path,
     key_file: &Path,
@@ -516,6 +515,10 @@ pub fn authenticate(
 /// reads the cap from the `max_attempts=N` module argument.
 ///
 /// Returns `Ok(false)` when the cap is hit without a successful signature.
+///
+/// `#[doc(hidden)]`: same caveat as [`authenticate`] — test helper, not
+/// part of the supported API surface.
+#[doc(hidden)]
 pub fn authenticate_with_max_attempts(
     socket_path: &Path,
     key_file: &Path,
@@ -534,15 +537,7 @@ pub fn authenticate_with_max_attempts(
         return Ok(false);
     }
 
-    let matched: Vec<(&agent::AgentIdentity, &keys::WebAuthnPublicKey)> = agent_identities
-        .iter()
-        .flat_map(|aid| {
-            authorized_keys
-                .iter()
-                .filter(move |ak| ak.key_blob == aid.key_blob)
-                .map(move |ak| (aid, ak))
-        })
-        .collect();
+    let matched = matched_pairs(&agent_identities, &authorized_keys);
 
     // See `do_authenticate` for the rationale behind iterating all matches.
     // Transport errors bubble up; protocol refusals / verification failures
