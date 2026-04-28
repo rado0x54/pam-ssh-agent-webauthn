@@ -14,6 +14,10 @@
 //! * `socket=PATH` — override `$SSH_AUTH_SOCK`.
 //! * `strict_modes=yes|no` — walk ancestor dir chain checking ownership and
 //!   modes; default `yes`. Mirrors OpenSSH `StrictModes`.
+//! * `max_attempts=N` — cap on sign requests issued per `pam_authenticate`
+//!   call; default `6`. Mirrors OpenSSH `MaxAuthTries`. Bounds the user-
+//!   visible touch prompts a hostile agent can force by advertising many
+//!   identities whose blobs match `authorized_keys`.
 //!
 //! ## How it works
 //!
@@ -41,6 +45,11 @@ use std::path::Path;
 
 const CHALLENGE_SIZE: usize = 32;
 const DEFAULT_KEY_FILE: &str = "/etc/security/authorized_keys";
+/// Default cap on sign requests issued per authenticate call. Mirrors
+/// OpenSSH's `MaxAuthTries` default. Bounds the touch prompts a hostile
+/// agent can force by advertising many identities whose blobs match
+/// `authorized_keys`. Tunable per PAM config via `max_attempts=N`.
+const DEFAULT_MAX_SIGN_ATTEMPTS: usize = 6;
 
 struct PamSshWebauthn;
 pam::pam_hooks!(PamSshWebauthn);
@@ -178,12 +187,14 @@ struct Config {
     key_file: String,
     socket_path: Option<String>,
     strict_modes: bool,
+    max_attempts: usize,
 }
 
 fn parse_args(args: &[&CStr]) -> Result<Config, String> {
     let mut key_file = DEFAULT_KEY_FILE.to_string();
     let mut socket_path = None;
     let mut strict_modes = true;
+    let mut max_attempts = DEFAULT_MAX_SIGN_ATTEMPTS;
 
     for arg in args {
         let s = arg.to_str().map_err(|e| format!("Invalid arg: {e}"))?;
@@ -197,6 +208,18 @@ fn parse_args(args: &[&CStr]) -> Result<Config, String> {
                 "no" | "false" | "0" => false,
                 other => return Err(format!("Invalid strict_modes value: {other}")),
             };
+        } else if let Some(value) = s.strip_prefix("max_attempts=") {
+            // Reject 0 explicitly: a cap of 0 would never call the agent at
+            // all, turning the module into an unconditional auth failure.
+            // That's almost certainly a config mistake, so refuse it loudly
+            // rather than silently locking everyone out.
+            let n: usize = value
+                .parse()
+                .map_err(|_| format!("Invalid max_attempts value: {value}"))?;
+            if n == 0 {
+                return Err(format!("Invalid max_attempts value: {value} (must be >= 1)"));
+            }
+            max_attempts = n;
         } else {
             // Refuse unknown args rather than silently dropping them: a typo
             // like `strictmodes=no` instead of `strict_modes=no` would
@@ -209,6 +232,7 @@ fn parse_args(args: &[&CStr]) -> Result<Config, String> {
         key_file,
         socket_path,
         strict_modes,
+        max_attempts,
     })
 }
 
@@ -295,64 +319,135 @@ fn do_authenticate(config: &Config, handle: &mut PamHandle) -> Result<(), AuthEr
     }
     info!("Found {} WebAuthn key(s) in agent", agent_identities.len());
 
-    // Iterate every (agent identity × authorized key) match and try them in
-    // order. A soft failure on one key (user denied the prompt, signature
-    // invalid, agent returned SSH_AGENT_FAILURE) is logged and skipped — only
-    // a transport/protocol failure or all-matches-exhausted produces an Err.
-    // Mirrors standard ssh-client behavior of trying each available identity.
-    let mut tried = 0;
-    for agent_id in &agent_identities {
-        for auth_key in &authorized_keys {
-            if agent_id.key_blob != auth_key.key_blob {
-                continue;
-            }
-            tried += 1;
-            debug!(
-                "Trying matched key: {} (app: {})",
-                auth_key.comment, auth_key.application
+    // Materialize the set of (agent identity × authorized key) matches up
+    // front so we can both enforce a cap on attempts and report the total
+    // match count when the cap is hit. Both inputs are bounded (the agent
+    // wire format caps the IDENTITIES_ANSWER message at 1 MiB, and
+    // authorized_keys is a root-owned file), so this allocation is small.
+    let matched = matched_pairs(&agent_identities, &authorized_keys);
+
+    // Iterate matches in order, capped at config.max_attempts. A soft failure
+    // on one key (user denied the prompt, signature invalid, agent returned
+    // SSH_AGENT_FAILURE) is logged and skipped — only a transport/protocol
+    // failure or hitting the cap / exhausting matches produces an Err.
+    // Mirrors standard ssh-client behavior of trying each available identity,
+    // with a cap analogous to OpenSSH's MaxAuthTries.
+    let cap = config.max_attempts;
+    match iter_attempts(socket, &matched, cap)? {
+        AttemptOutcome::Succeeded => Ok(()),
+        AttemptOutcome::CapHit { tried } => {
+            // A hostile agent advertising N>cap identities matching
+            // authorized_keys would otherwise force N user-presence prompts;
+            // record what we saw so operators can spot the pattern in syslog.
+            // Phrased to match the AuthFail message below so a single grep
+            // for `sign-attempt cap of {N} reached` finds both log lines.
+            warn!(
+                "pam_ssh_agent_webauthn: sign-attempt cap of {cap} reached: \
+                 agent_identities={}, matched_pairs={}, attempts={}",
+                agent_identities.len(),
+                matched.len(),
+                tried
             );
-            match try_authenticate(socket, auth_key, &agent_id.key_blob) {
-                Ok(()) => return Ok(()),
-                Err(TryAuthOutcome::Refused(msg)) => {
-                    warn!(
-                        "pam_ssh_agent_webauthn: key '{}' refused, trying next: {msg}",
-                        auth_key.comment
-                    );
-                }
-                Err(TryAuthOutcome::VerifyFailed(msg)) => {
-                    warn!(
-                        "pam_ssh_agent_webauthn: key '{}' verification failed, trying next: {msg}",
-                        auth_key.comment
-                    );
-                }
-                Err(TryAuthOutcome::Transport(e)) => {
-                    return Err(classify_io_err(
-                        e,
-                        &format!("agent sign for key '{}'", auth_key.comment),
-                    ));
-                }
-                Err(TryAuthOutcome::Random(msg)) => {
-                    return Err(AuthError::Service(format!(
-                        "challenge generation: {msg}"
-                    )));
-                }
+            Err(AuthError::AuthFail(format!(
+                "sign-attempt cap of {cap} reached; tried {tried} of {} match(es)",
+                matched.len()
+            )))
+        }
+        // Both branches are AuthFail: the agent presented WebAuthn keys but
+        // the user could not (or chose not to) prove possession of one that's
+        // listed in authorized_keys. Contrast with the empty-agent_identities
+        // branch above, which is InfoUnavailable.
+        AttemptOutcome::Exhausted { tried: 0 } => Err(AuthError::AuthFail(
+            "no agent key matched authorized_keys".into(),
+        )),
+        AttemptOutcome::Exhausted { tried } => Err(AuthError::AuthFail(format!(
+            "all {tried} matching key(s) failed to authenticate"
+        ))),
+    }
+}
+
+/// Build the cartesian product of (agent identity × authorized key) pairs
+/// whose key blobs match exactly. Centralized so both the PAM hook path and
+/// the bundled `authenticate` helper apply the same matching rule —
+/// canonicalization changes (e.g. application-string normalization) only
+/// need updating in one place.
+fn matched_pairs<'a>(
+    agent_identities: &'a [agent::AgentIdentity],
+    authorized_keys: &'a [keys::WebAuthnPublicKey],
+) -> Vec<(&'a agent::AgentIdentity, &'a keys::WebAuthnPublicKey)> {
+    agent_identities
+        .iter()
+        .flat_map(|aid| {
+            authorized_keys
+                .iter()
+                .filter(move |ak| ak.key_blob == aid.key_blob)
+                .map(move |ak| (aid, ak))
+        })
+        .collect()
+}
+
+/// Outcome of iterating matched (agent ↔ authorized_keys) pairs up to a cap.
+/// Encoded as an enum so the three terminal states (signed, cap reached,
+/// matches exhausted) are mutually exclusive at the type level — the call
+/// site reads as an exhaustive `match` rather than two sequential `if`s.
+enum AttemptOutcome {
+    /// One of the attempts produced a verified signature. The attempt count
+    /// is not carried — the caller's only job on success is to return
+    /// `PAM_SUCCESS` / `Ok(true)`, and no log message currently consumes it.
+    Succeeded,
+    /// Iteration stopped because the cap was reached before all matches
+    /// could be tried.
+    CapHit { tried: usize },
+    /// Every available match was tried (or there were none); none succeeded.
+    Exhausted { tried: usize },
+}
+
+/// Iterate matched pairs, sending sign requests until one succeeds, the cap
+/// is reached, or the matches are exhausted. Transport / random-source
+/// failures bubble up as `AuthError`.
+fn iter_attempts(
+    socket: &Path,
+    matched: &[(&agent::AgentIdentity, &keys::WebAuthnPublicKey)],
+    cap: usize,
+) -> Result<AttemptOutcome, AuthError> {
+    let mut tried = 0;
+    for (agent_id, auth_key) in matched.iter() {
+        if tried >= cap {
+            return Ok(AttemptOutcome::CapHit { tried });
+        }
+        tried += 1;
+        debug!(
+            "Trying matched key: {} (app: {})",
+            auth_key.comment, auth_key.application
+        );
+        match try_authenticate(socket, auth_key, &agent_id.key_blob) {
+            Ok(()) => return Ok(AttemptOutcome::Succeeded),
+            Err(TryAuthOutcome::Refused(msg)) => {
+                warn!(
+                    "pam_ssh_agent_webauthn: key '{}' refused, trying next: {msg}",
+                    auth_key.comment
+                );
+            }
+            Err(TryAuthOutcome::VerifyFailed(msg)) => {
+                warn!(
+                    "pam_ssh_agent_webauthn: key '{}' verification failed, trying next: {msg}",
+                    auth_key.comment
+                );
+            }
+            Err(TryAuthOutcome::Transport(e)) => {
+                return Err(classify_io_err(
+                    e,
+                    &format!("agent sign for key '{}'", auth_key.comment),
+                ));
+            }
+            Err(TryAuthOutcome::Random(msg)) => {
+                return Err(AuthError::Service(format!(
+                    "challenge generation: {msg}"
+                )));
             }
         }
     }
-
-    // Both branches are AuthFail: the agent presented WebAuthn keys but the
-    // user could not (or chose not to) prove possession of one that's listed
-    // in authorized_keys. Contrast with the empty-agent_identities branch
-    // above, which is InfoUnavailable.
-    if tried == 0 {
-        Err(AuthError::AuthFail(
-            "no agent key matched authorized_keys".into(),
-        ))
-    } else {
-        Err(AuthError::AuthFail(format!(
-            "all {tried} matching key(s) failed to authenticate"
-        )))
-    }
+    Ok(AttemptOutcome::Exhausted { tried })
 }
 
 fn try_authenticate(
@@ -405,10 +500,35 @@ fn init_logging() {
 /// If you are embedding this crate outside the PAM hook, do not call this
 /// function with attacker-influenceable paths. Use [`authfile::open_secure`]
 /// + [`keys::parse_authorized_keys_str`] yourself.
+///
+/// `#[doc(hidden)]`: kept `pub` for the bundled examples and `tests/`
+/// integration crate, but not part of the supported API surface.
+#[doc(hidden)]
 pub fn authenticate(
     socket_path: &Path,
     key_file: &Path,
 ) -> Result<bool, Box<dyn std::error::Error>> {
+    authenticate_with_max_attempts(socket_path, key_file, DEFAULT_MAX_SIGN_ATTEMPTS)
+}
+
+/// Like [`authenticate`] but with a caller-supplied cap on how many sign
+/// requests are issued to the agent. Used by integration tests to exercise
+/// the cap behavior; production callers should use the PAM hook, which
+/// reads the cap from the `max_attempts=N` module argument.
+///
+/// Returns `Ok(false)` when the cap is hit without a successful signature.
+///
+/// `#[doc(hidden)]`: same caveat as [`authenticate`] — test helper, not
+/// part of the supported API surface.
+#[doc(hidden)]
+pub fn authenticate_with_max_attempts(
+    socket_path: &Path,
+    key_file: &Path,
+    max_attempts: usize,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    if max_attempts == 0 {
+        return Err("max_attempts must be >= 1".into());
+    }
     let authorized_keys = keys::parse_authorized_keys(key_file)?;
     if authorized_keys.is_empty() {
         return Ok(false);
@@ -419,20 +539,23 @@ pub fn authenticate(
         return Ok(false);
     }
 
+    let matched = matched_pairs(&agent_identities, &authorized_keys);
+
     // See `do_authenticate` for the rationale behind iterating all matches.
     // Transport errors bubble up; protocol refusals / verification failures
-    // fall through to the next match.
-    for agent_id in &agent_identities {
-        for auth_key in &authorized_keys {
-            if agent_id.key_blob != auth_key.key_blob {
-                continue;
-            }
-            match try_authenticate(socket_path, auth_key, &agent_id.key_blob) {
-                Ok(()) => return Ok(true),
-                Err(TryAuthOutcome::Transport(e)) => return Err(Box::new(e)),
-                Err(TryAuthOutcome::Random(msg)) => return Err(msg.into()),
-                Err(TryAuthOutcome::Refused(_)) | Err(TryAuthOutcome::VerifyFailed(_)) => continue,
-            }
+    // fall through to the next match. Cap on attempts mirrors the PAM hook.
+    //
+    // Deliberately does NOT reuse `iter_attempts`: that helper emits the
+    // operator-facing WARN syslog line on cap hit, which is meaningful only
+    // in the PAM hook context (root, syslog wired up). If this helper is
+    // ever promoted out of `#[doc(hidden)]` to a supported API, switch to
+    // `iter_attempts` so embedders get the same observability.
+    for (agent_id, auth_key) in matched.iter().take(max_attempts) {
+        match try_authenticate(socket_path, auth_key, &agent_id.key_blob) {
+            Ok(()) => return Ok(true),
+            Err(TryAuthOutcome::Transport(e)) => return Err(Box::new(e)),
+            Err(TryAuthOutcome::Random(msg)) => return Err(msg.into()),
+            Err(TryAuthOutcome::Refused(_)) | Err(TryAuthOutcome::VerifyFailed(_)) => continue,
         }
     }
 
@@ -460,14 +583,45 @@ mod tests {
         assert_eq!(cfg.key_file, DEFAULT_KEY_FILE);
         assert!(cfg.socket_path.is_none());
         assert!(cfg.strict_modes);
+        assert_eq!(cfg.max_attempts, DEFAULT_MAX_SIGN_ATTEMPTS);
     }
 
     #[test]
     fn parse_args_known_keys() {
-        let cfg = parse(&["file=/x", "socket=/y", "strict_modes=no"]).unwrap();
+        let cfg = parse(&["file=/x", "socket=/y", "strict_modes=no", "max_attempts=3"]).unwrap();
         assert_eq!(cfg.key_file, "/x");
         assert_eq!(cfg.socket_path.as_deref(), Some("/y"));
         assert!(!cfg.strict_modes);
+        assert_eq!(cfg.max_attempts, 3);
+    }
+
+    #[test]
+    fn parse_args_max_attempts_overrides_default() {
+        let cfg = parse(&["max_attempts=1"]).unwrap();
+        assert_eq!(cfg.max_attempts, 1);
+        let cfg = parse(&["max_attempts=42"]).unwrap();
+        assert_eq!(cfg.max_attempts, 42);
+    }
+
+    #[test]
+    fn parse_args_repeated_max_attempts_last_wins() {
+        // Pinning the silent-overwrite contract: if `max_attempts=` appears
+        // twice, the rightmost value wins (consistent with how `file=`,
+        // `socket=`, and `strict_modes=` already behave). Locks this in so
+        // a future change to "reject duplicates" doesn't break PAM stacks
+        // that rely on overlay-style arg composition.
+        let cfg = parse(&["max_attempts=1", "max_attempts=5"]).unwrap();
+        assert_eq!(cfg.max_attempts, 5);
+    }
+
+    #[test]
+    fn parse_args_rejects_invalid_max_attempts() {
+        // Zero would silently turn the module into an unconditional fail —
+        // refuse it. Negatives and non-numerics are typos and equally bad.
+        for bad in ["max_attempts=0", "max_attempts=-1", "max_attempts=abc", "max_attempts="] {
+            let err = parse(&[bad]).expect_err(&format!("expected error for {bad}"));
+            assert!(err.contains("max_attempts"), "wrong error for {bad}: {err}");
+        }
     }
 
     #[test]

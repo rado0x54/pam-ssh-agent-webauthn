@@ -116,6 +116,16 @@ To override the agent socket path (instead of `$SSH_AUTH_SOCK`):
 auth sufficient pam_ssh_agent_webauthn.so socket=/path/to/agent.sock
 ```
 
+To cap how many sign requests are issued per `pam_authenticate` call (mirrors OpenSSH's `MaxAuthTries`; default `6`):
+
+```
+auth sufficient pam_ssh_agent_webauthn.so max_attempts=1
+```
+
+This bounds the number of user-presence prompts a misbehaving or hostile ssh-agent can force by advertising many identities whose key blobs match `authorized_keys`. Raise it for users with many enrolled credentials. Must be `>= 1`.
+
+**Note on `max_attempts=1`:** the agent controls the order of identities returned in `IDENTITIES_ANSWER`. With a cap of `1`, a buggy or hostile agent that fronts a matching-but-non-signing identity ahead of the real one will cause legitimate auths to fail (the real key is never reached). The default of `6` self-heals because iteration continues past denied keys. If you see `sign-attempt cap of 1 reached` in syslog while users hold valid credentials, raise this value.
+
 ### Authorized-keys file protection
 
 `authorized_keys` is the trust root: each line binds an EC point and an `application` (RP-ID) string into a credential identity that root pinned at registration time. The module enforces an OpenSSH-style ladder before reading the file:
