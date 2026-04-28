@@ -66,7 +66,17 @@ impl PamHooks for PamSshWebauthn {
     }
 
     fn sm_setcred(_handle: &mut PamHandle, _args: Vec<&CStr>, _flags: PamFlag) -> PamResultCode {
-        // Required by doas — nothing to do
+        // This module performs authentication only; it issues no credential
+        // material (no Kerberos tickets, AFS tokens, session keyrings, etc.)
+        // and does not manage uid/gid context — that is the calling
+        // application's job. So sm_setcred is genuinely a no-op for us.
+        //
+        // The strictly-correct return for a no-op setcred would be PAM_IGNORE,
+        // but doas treats anything other than PAM_SUCCESS as failure and emits
+        // `doas: pam_setcred(?, PAM_REINITIALIZE_CRED): Permission denied`.
+        // Returning SUCCESS interoperates with sudo, login, sshd, and doas
+        // alike. Other auth-only modules (pam_google_authenticator, upstream
+        // pam-ssh-agent) make the same choice for the same reason.
         PamResultCode::PAM_SUCCESS
     }
 }

@@ -51,10 +51,25 @@ struct WebAuthnSignature {
 /// ## Counter validation
 ///
 /// The WebAuthn counter is integrity-protected (included in signed_data) but NOT
-/// checked for monotonic increase. Counter validation requires persistent state
-/// (tracking the last-seen counter per key), which is not appropriate for a
-/// stateless PAM module. If counter validation is needed, it should be implemented
-/// at the application layer with a persistent store.
+/// checked for monotonic increase. This is a deliberate design decision, not an
+/// oversight:
+///
+/// * The intended deployment uses synced passkeys (the same credential lives in
+///   multiple places — phone, laptop, hardware security key, password manager),
+///   and the same passkey is reused for SSH/PAM auth and ordinary web login.
+///   Synced passkeys typically report counter = 0, and even when they don't, the
+///   counter is not globally monotonic across copies — strict monotonic checks
+///   would reject legitimate use.
+/// * Replay protection is provided by the per-auth random challenge (32 bytes
+///   from getrandom, fresh per attempt). The counter is a defense against cloned
+///   *single-device* hardware tokens, which is not the threat model here.
+/// * Tracking the last-seen counter per credential would require persistent
+///   state, which a stateless PAM module shouldn't own. If that defense is ever
+///   needed for a hardware-token deployment, it belongs at the application layer
+///   with its own store.
+///
+/// OpenSSH's own sk-ecdsa verification and upstream pam-ssh-agent take the same
+/// stance.
 pub fn verify_webauthn_sk(
     key: &WebAuthnPublicKey,
     challenge: &[u8],
