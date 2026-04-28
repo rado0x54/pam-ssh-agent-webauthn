@@ -149,7 +149,6 @@ The module distinguishes failure modes so PAM stacks can route on them:
 | `PAM_AUTH_ERR` | No agent key matched `authorized_keys`, or every matched key was refused / failed verification (user denied the touch, agent rejected, etc.). |
 | `PAM_AUTHINFO_UNAVAIL` | `SSH_AUTH_SOCK` not set, agent socket unreachable, agent advertises no WebAuthn keys, or `authorized_keys` is empty. The module is fine — the info needed to authenticate just isn't present. |
 | `PAM_SERVICE_ERR` | Module misconfiguration (bad arg, unreadable / unsafe `authorized_keys`), or the agent returned a malformed protocol message. |
-| `PAM_USER_UNKNOWN` | PAM did not supply a user identity. |
 
 This lets you compose stacks like:
 
