@@ -49,6 +49,11 @@ pub struct WebAuthnPublicKey {
     pub application: String,
     /// Optional comment from the authorized_keys line.
     pub comment: String,
+    /// Per-key `verify-required` option from the authorized_keys options
+    /// field. When true, the WebAuthn assertion for this key must carry the
+    /// UV (User Verification) flag — independent of the module-wide setting,
+    /// which is OR-ed in at the call site.
+    pub verify_required: bool,
 }
 
 /// Parse all WebAuthn SK public keys from an authorized_keys file.
@@ -74,6 +79,12 @@ pub fn parse_authorized_keys_str(content: &str) -> Vec<WebAuthnPublicKey> {
 /// Parse a single authorized_keys line for a webauthn-sk-ecdsa key.
 ///
 /// Format: `[options] webauthn-sk-ecdsa-sha2-nistp256@openssh.com <base64> [comment]`
+///
+/// Options handling: only `verify-required` is recognised. Any other option
+/// tokens (`cert-authority`, `command="..."`, `from="..."`, etc.) are
+/// silently tolerated as today — they have no effect on this module. Options
+/// may appear as separate whitespace-delimited tokens or as a single
+/// comma-separated token, matching OpenSSH's authorized_keys(5) grammar.
 fn parse_authorized_key_line(line: &str) -> Option<WebAuthnPublicKey> {
     let parts: Vec<&str> = line.split_whitespace().collect();
 
@@ -84,6 +95,15 @@ fn parse_authorized_key_line(line: &str) -> Option<WebAuthnPublicKey> {
         log::debug!("No base64 data after algorithm in line");
         return None;
     }
+
+    // Scan the options field (everything before the algorithm token) for
+    // `verify-required`. OpenSSH option names are case-insensitive, and the
+    // canonical form packs them comma-separated into a single token, but
+    // some operators write them whitespace-separated — handle both.
+    let verify_required = parts[..algo_idx]
+        .iter()
+        .flat_map(|tok| tok.split(','))
+        .any(|opt| opt.trim().eq_ignore_ascii_case("verify-required"));
 
     let key_blob = match BASE64_STANDARD.decode(parts[b64_idx]) {
         Ok(blob) => blob,
@@ -105,6 +125,7 @@ fn parse_authorized_key_line(line: &str) -> Option<WebAuthnPublicKey> {
             ec_point,
             application,
             comment,
+            verify_required,
         }),
         None => {
             log::debug!("Failed to parse key blob");
@@ -197,6 +218,54 @@ mod tests {
         assert_eq!(key.application, "localhost");
         assert_eq!(key.comment, "my-key-comment");
         assert_eq!(key.ec_point.len(), 65);
+        // Default: no per-key verify-required option.
+        assert!(!key.verify_required);
+    }
+
+    #[test]
+    fn test_parse_authorized_key_line_verify_required_token() {
+        let blob = make_test_key_blob("localhost");
+        let b64 = BASE64_STANDARD.encode(&blob);
+        let line = format!("verify-required {WEBAUTHN_SK_ALGO} {b64} my-key");
+
+        let key = parse_authorized_key_line(&line).unwrap();
+        assert!(key.verify_required);
+        assert_eq!(key.comment, "my-key");
+    }
+
+    #[test]
+    fn test_parse_authorized_key_line_verify_required_in_comma_options() {
+        // OpenSSH's canonical form packs options into a single comma-separated
+        // token. Other options sit alongside `verify-required` and must not
+        // mask it.
+        let blob = make_test_key_blob("localhost");
+        let b64 = BASE64_STANDARD.encode(&blob);
+        let line = format!("cert-authority,verify-required {WEBAUTHN_SK_ALGO} {b64}");
+
+        let key = parse_authorized_key_line(&line).unwrap();
+        assert!(key.verify_required);
+    }
+
+    #[test]
+    fn test_parse_authorized_key_line_verify_required_case_insensitive() {
+        // OpenSSH option names are case-insensitive — match that.
+        let blob = make_test_key_blob("localhost");
+        let b64 = BASE64_STANDARD.encode(&blob);
+        let line = format!("Verify-Required {WEBAUTHN_SK_ALGO} {b64}");
+
+        let key = parse_authorized_key_line(&line).unwrap();
+        assert!(key.verify_required);
+    }
+
+    #[test]
+    fn test_parse_authorized_key_line_other_options_do_not_set_uv() {
+        // Unrelated options must not flip the flag.
+        let blob = make_test_key_blob("localhost");
+        let b64 = BASE64_STANDARD.encode(&blob);
+        let line = format!("cert-authority {WEBAUTHN_SK_ALGO} {b64}");
+
+        let key = parse_authorized_key_line(&line).unwrap();
+        assert!(!key.verify_required);
     }
 
     #[test]
