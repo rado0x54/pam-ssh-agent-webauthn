@@ -139,6 +139,26 @@ This bounds the number of user-presence prompts a misbehaving or hostile ssh-age
 auth sufficient pam_ssh_agent_webauthn.so strict_modes=no
 ```
 
+### User Verification (UV) enforcement
+
+WebAuthn assertions carry both a UP bit (User Presence — touch) and a UV bit (User Verification — PIN or biometric). UP is always required by this module; UV is opt-in because not every authenticator supports it.
+
+Two independent knobs control UV enforcement, both off by default:
+
+- **Module-wide**, applies to every key:
+  ```
+  auth sufficient pam_ssh_agent_webauthn.so verify_required=yes
+  ```
+- **Per-key**, as an option in `/etc/security/authorized_keys`:
+  ```
+  verify-required webauthn-sk-ecdsa-sha2-nistp256@openssh.com AAAA... user@host
+  ```
+  Multiple options combine into a single comma-separated token before the algorithm, per OpenSSH's `authorized_keys(5)` grammar (e.g. `cert-authority,verify-required webauthn-sk-…`). Quoted values are honored (`from="a,b",verify-required …` — the comma inside `"…"` is part of the value, not an option separator). Only `verify-required` is acted on; other options (`cert-authority`, `command="…"`, `from="…"`, etc.) are tolerated but have no effect on this module.
+
+UV is enforced if **either** says so — whichever rule is stricter wins. With both off (the default), the UV bit is ignored, preserving compatibility with authenticators that do not support PIN/biometric prompts. When UV is required but the assertion lacks the bit, authentication fails with `PAM_AUTH_ERR`.
+
+These are the same two surfaces OpenSSH exposes for SK keys (`PubkeyAuthOptions verify-required` in `sshd_config` and the `verify-required` `authorized_keys` option) — except the global form lives on the PAM module line, since this module never sees `sshd_config`.
+
 ### PAM return codes
 
 The module distinguishes failure modes so PAM stacks can route on them:
@@ -234,7 +254,7 @@ The following checks are performed, matching OpenSSH's `webauthn_check_prepare_h
 ### Limitations
 
 - **No counter/replay protection**: The WebAuthn counter is integrity-protected (included in signed_data) but not checked for monotonic increase. Counter validation requires persistent state (tracking the last-seen counter per key), which is not appropriate for a stateless PAM module. This means a captured signature cannot be replayed (the challenge is fresh each time), but a cloned authenticator with a reset counter would not be detected.
-- **No User Verification (UV) enforcement**: The UV flag is not required, as some authenticators may not support it. UP (User Presence) is always required.
+- **User Verification (UV) is opt-in**: The default is permissive (UP only) so that authenticators without PIN/biometric support keep working. Operators who want to enforce UV have two independent knobs — a module-wide arg and a per-key option — see [User Verification (UV) enforcement](#user-verification-uv-enforcement) below. UP (User Presence) is always required.
 
 ## Logging
 

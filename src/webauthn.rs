@@ -14,6 +14,7 @@ use crate::keys::WebAuthnPublicKey;
 
 // WebAuthn authenticator flags (from the spec)
 const FLAG_UP: u8 = 0x01; // User Presence
+const FLAG_UV: u8 = 0x04; // User Verification
 const FLAG_AD: u8 = 0x40; // Attested Credential Data
 const FLAG_ED: u8 = 0x80; // Extension Data
 
@@ -74,11 +75,12 @@ pub fn verify_webauthn_sk(
     key: &WebAuthnPublicKey,
     challenge: &[u8],
     raw_sig_blob: &[u8],
+    uv_required: bool,
 ) -> Result<(), VerifyError> {
     let sig = parse_webauthn_signature(raw_sig_blob)?;
 
     // Validate flags per WebAuthn/OpenSSH spec
-    validate_flags(sig.flags, &sig.extensions)?;
+    validate_flags(sig.flags, &sig.extensions, uv_required)?;
 
     // Validate origin contains no quote characters (prevents JSON injection,
     // matches OpenSSH's webauthn_check_prepare_hash validation)
@@ -155,11 +157,25 @@ impl From<io::Error> for VerifyError {
 // --- Validation ---
 
 /// Validate authenticator flags per WebAuthn spec and OpenSSH convention.
-fn validate_flags(flags: u8, extensions: &[u8]) -> Result<(), VerifyError> {
+///
+/// `uv_required` is the merged decision from the module-wide `verify_required`
+/// arg and the per-key `verify-required` option (UV is enforced if either says
+/// so). When `false`, UV is left unchecked to preserve compatibility with
+/// authenticators that do not support PIN/biometric prompts.
+fn validate_flags(flags: u8, extensions: &[u8], uv_required: bool) -> Result<(), VerifyError> {
     // User Presence (UP) must be set — required for sudo authentication
     if flags & FLAG_UP == 0 {
         return Err(VerifyError::InvalidFlags(
             "User Presence (UP) flag not set".to_string(),
+        ));
+    }
+
+    // User Verification (UV) is enforced only when the operator opts in,
+    // because not every authenticator supports it (some hardware tokens
+    // implement UP but not UV).
+    if uv_required && flags & FLAG_UV == 0 {
+        return Err(VerifyError::InvalidFlags(
+            "User Verification (UV) flag not set but verify-required is in effect".to_string(),
         ));
     }
 
@@ -556,35 +572,55 @@ mod tests {
     #[test]
     fn test_validate_flags_up_required() {
         // flags=0x00 — no UP → reject
-        let err = validate_flags(0x00, &[]).unwrap_err();
+        let err = validate_flags(0x00, &[], false).unwrap_err();
         assert!(matches!(err, VerifyError::InvalidFlags(_)));
 
         // flags=0x01 — UP set → ok
-        assert!(validate_flags(0x01, &[]).is_ok());
+        assert!(validate_flags(0x01, &[], false).is_ok());
 
         // flags=0x05 — UP + UV → ok
-        assert!(validate_flags(0x05, &[]).is_ok());
+        assert!(validate_flags(0x05, &[], false).is_ok());
     }
 
     #[test]
     fn test_validate_flags_ad_rejected() {
         // AD flag (0x40) must not be set
-        let err = validate_flags(0x41, &[]).unwrap_err(); // UP + AD
+        let err = validate_flags(0x41, &[], false).unwrap_err(); // UP + AD
         assert!(matches!(err, VerifyError::InvalidFlags(_)));
     }
 
     #[test]
     fn test_validate_flags_ed_consistency() {
         // ED set but no extensions → reject
-        let err = validate_flags(0x81, &[]).unwrap_err(); // UP + ED, empty extensions
+        let err = validate_flags(0x81, &[], false).unwrap_err(); // UP + ED, empty extensions
         assert!(matches!(err, VerifyError::InvalidFlags(_)));
 
         // ED not set but extensions present → reject
-        let err = validate_flags(0x01, &[0x01, 0x02]).unwrap_err();
+        let err = validate_flags(0x01, &[0x01, 0x02], false).unwrap_err();
         assert!(matches!(err, VerifyError::InvalidFlags(_)));
 
         // ED set with extensions → ok
-        assert!(validate_flags(0x81, &[0x01, 0x02]).is_ok());
+        assert!(validate_flags(0x81, &[0x01, 0x02], false).is_ok());
+    }
+
+    #[test]
+    fn test_validate_flags_uv_required_ok_when_set() {
+        // verify-required is in effect AND UV bit is set → accept.
+        assert!(validate_flags(FLAG_UP | FLAG_UV, &[], true).is_ok());
+    }
+
+    #[test]
+    fn test_validate_flags_uv_required_rejects_when_unset() {
+        // verify-required is in effect but UV bit is missing → InvalidFlags.
+        let err = validate_flags(FLAG_UP, &[], true).unwrap_err();
+        assert!(matches!(err, VerifyError::InvalidFlags(_)));
+    }
+
+    #[test]
+    fn test_validate_flags_uv_unset_ok_when_not_required() {
+        // Default behavior (no opt-in): UV bit unset must still pass so that
+        // authenticators without UV support keep working.
+        assert!(validate_flags(FLAG_UP, &[], false).is_ok());
     }
 
     #[test]

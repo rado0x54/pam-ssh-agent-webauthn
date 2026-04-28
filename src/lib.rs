@@ -18,6 +18,10 @@
 //!   call; default `6`. Mirrors OpenSSH `MaxAuthTries`. Bounds the user-
 //!   visible touch prompts a hostile agent can force by advertising many
 //!   identities whose blobs match `authorized_keys`.
+//! * `verify_required=yes|no` — require the WebAuthn UV (User Verification)
+//!   bit on every assertion; default `no`. Per-key `verify-required` in
+//!   `authorized_keys` is honored independently — UV is enforced if either
+//!   says so.
 //!
 //! ## How it works
 //!
@@ -181,6 +185,7 @@ struct Config {
     socket_path: Option<String>,
     strict_modes: bool,
     max_attempts: usize,
+    verify_required: bool,
 }
 
 fn parse_args(args: &[&CStr]) -> Result<Config, String> {
@@ -188,6 +193,7 @@ fn parse_args(args: &[&CStr]) -> Result<Config, String> {
     let mut socket_path = None;
     let mut strict_modes = true;
     let mut max_attempts = DEFAULT_MAX_SIGN_ATTEMPTS;
+    let mut verify_required = false;
 
     for arg in args {
         let s = arg.to_str().map_err(|e| format!("Invalid arg: {e}"))?;
@@ -213,6 +219,12 @@ fn parse_args(args: &[&CStr]) -> Result<Config, String> {
                 return Err(format!("Invalid max_attempts value: {value} (must be >= 1)"));
             }
             max_attempts = n;
+        } else if let Some(value) = s.strip_prefix("verify_required=") {
+            verify_required = match value {
+                "yes" | "true" | "1" => true,
+                "no" | "false" | "0" => false,
+                other => return Err(format!("Invalid verify_required value: {other}")),
+            };
         } else {
             // Refuse unknown args rather than silently dropping them: a typo
             // like `strictmodes=no` instead of `strict_modes=no` would
@@ -226,6 +238,7 @@ fn parse_args(args: &[&CStr]) -> Result<Config, String> {
         socket_path,
         strict_modes,
         max_attempts,
+        verify_required,
     })
 }
 
@@ -336,7 +349,7 @@ fn do_authenticate(config: &Config, handle: &mut PamHandle) -> Result<(), AuthEr
     // Mirrors standard ssh-client behavior of trying each available identity,
     // with a cap analogous to OpenSSH's MaxAuthTries.
     let cap = config.max_attempts;
-    match iter_attempts(socket, &matched, cap)? {
+    match iter_attempts(socket, &matched, cap, config.verify_required)? {
         AttemptOutcome::Succeeded => Ok(()),
         AttemptOutcome::CapHit { tried } => {
             // A hostile agent advertising N>cap identities matching
@@ -412,6 +425,7 @@ fn iter_attempts(
     socket: &Path,
     matched: &[(&agent::AgentIdentity, &keys::WebAuthnPublicKey)],
     cap: usize,
+    module_uv_required: bool,
 ) -> Result<AttemptOutcome, AuthError> {
     let mut tried = 0;
     for (agent_id, auth_key) in matched.iter() {
@@ -423,7 +437,7 @@ fn iter_attempts(
             "Trying matched key: {} (app: {})",
             auth_key.comment, auth_key.application
         );
-        match try_authenticate(socket, auth_key, &agent_id.key_blob) {
+        match try_authenticate(socket, auth_key, &agent_id.key_blob, module_uv_required) {
             Ok(()) => return Ok(AttemptOutcome::Succeeded),
             Err(TryAuthOutcome::Refused(msg)) => {
                 warn!(
@@ -457,6 +471,7 @@ fn try_authenticate(
     socket: &Path,
     key: &keys::WebAuthnPublicKey,
     key_blob: &[u8],
+    module_uv_required: bool,
 ) -> Result<(), TryAuthOutcome> {
     // Generate random challenge
     let mut challenge = [0u8; CHALLENGE_SIZE];
@@ -474,8 +489,12 @@ fn try_authenticate(
         }
     };
 
+    // UV is enforced if either the module-wide arg or the per-key option
+    // requires it (whichever is stricter wins).
+    let uv_required = module_uv_required || key.verify_required;
+
     // Verify WebAuthn signature
-    webauthn::verify_webauthn_sk(key, &challenge, &raw_sig)
+    webauthn::verify_webauthn_sk(key, &challenge, &raw_sig, uv_required)
         .map_err(|e| TryAuthOutcome::VerifyFailed(e.to_string()))?;
 
     Ok(())
@@ -511,7 +530,7 @@ pub fn authenticate(
     socket_path: &Path,
     key_file: &Path,
 ) -> Result<bool, Box<dyn std::error::Error>> {
-    authenticate_with_max_attempts(socket_path, key_file, DEFAULT_MAX_SIGN_ATTEMPTS)
+    authenticate_with_options(socket_path, key_file, DEFAULT_MAX_SIGN_ATTEMPTS, false)
 }
 
 /// Like [`authenticate`] but with a caller-supplied cap on how many sign
@@ -528,6 +547,24 @@ pub fn authenticate_with_max_attempts(
     socket_path: &Path,
     key_file: &Path,
     max_attempts: usize,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    authenticate_with_options(socket_path, key_file, max_attempts, false)
+}
+
+/// Like [`authenticate_with_max_attempts`] but also exposes the module-wide
+/// `verify_required` knob, so integration tests can drive the full UV
+/// pipeline (parse_args → Config.verify_required → try_authenticate →
+/// validate_flags) end-to-end. Per-key `verify-required` from
+/// `authorized_keys` is OR-combined as in the PAM hook — stricter wins.
+///
+/// `#[doc(hidden)]`: same caveat as [`authenticate`] — test helper, not
+/// part of the supported API surface.
+#[doc(hidden)]
+pub fn authenticate_with_options(
+    socket_path: &Path,
+    key_file: &Path,
+    max_attempts: usize,
+    module_uv_required: bool,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     if max_attempts == 0 {
         return Err("max_attempts must be >= 1".into());
@@ -554,7 +591,7 @@ pub fn authenticate_with_max_attempts(
     // ever promoted out of `#[doc(hidden)]` to a supported API, switch to
     // `iter_attempts` so embedders get the same observability.
     for (agent_id, auth_key) in matched.iter().take(max_attempts) {
-        match try_authenticate(socket_path, auth_key, &agent_id.key_blob) {
+        match try_authenticate(socket_path, auth_key, &agent_id.key_blob, module_uv_required) {
             Ok(()) => return Ok(true),
             Err(TryAuthOutcome::Transport(e)) => return Err(Box::new(e)),
             Err(TryAuthOutcome::Random(msg)) => return Err(msg.into()),
@@ -587,15 +624,46 @@ mod tests {
         assert!(cfg.socket_path.is_none());
         assert!(cfg.strict_modes);
         assert_eq!(cfg.max_attempts, DEFAULT_MAX_SIGN_ATTEMPTS);
+        // Default preserves current behavior: UV not required.
+        assert!(!cfg.verify_required);
     }
 
     #[test]
     fn parse_args_known_keys() {
-        let cfg = parse(&["file=/x", "socket=/y", "strict_modes=no", "max_attempts=3"]).unwrap();
+        let cfg = parse(&[
+            "file=/x",
+            "socket=/y",
+            "strict_modes=no",
+            "max_attempts=3",
+            "verify_required=yes",
+        ])
+        .unwrap();
         assert_eq!(cfg.key_file, "/x");
         assert_eq!(cfg.socket_path.as_deref(), Some("/y"));
         assert!(!cfg.strict_modes);
         assert_eq!(cfg.max_attempts, 3);
+        assert!(cfg.verify_required);
+    }
+
+    #[test]
+    fn parse_args_verify_required_accepts_synonyms() {
+        for (val, expected) in [
+            ("yes", true),
+            ("true", true),
+            ("1", true),
+            ("no", false),
+            ("false", false),
+            ("0", false),
+        ] {
+            let cfg = parse(&[&format!("verify_required={val}")]).unwrap();
+            assert_eq!(cfg.verify_required, expected, "value {val}");
+        }
+    }
+
+    #[test]
+    fn parse_args_rejects_invalid_verify_required_value() {
+        let err = parse(&["verify_required=maybe"]).unwrap_err();
+        assert!(err.contains("verify_required"), "got: {err}");
     }
 
     #[test]
