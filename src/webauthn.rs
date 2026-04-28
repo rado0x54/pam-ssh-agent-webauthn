@@ -629,6 +629,51 @@ mod tests {
     }
 
     #[test]
+    fn test_read_ssh_mpint_rfc4251_examples() {
+        // RFC 4251 §5 lists five example mpint encodings (full SSH-string framing,
+        // including the 4-byte length prefix). All five round-trip through our
+        // parser exactly as the RFC's value/representation table demands.
+        //
+        // value       representation                 expected outcome
+        // 0           00 00 00 00                    accept, []
+        // 9a378f...   00 00 00 08 09 a3 78 ... a7    accept, payload as-is
+        // 80          00 00 00 02 00 80              accept, strip → [0x80]
+        // -1234       00 00 00 02 ed cc              reject (negative)
+        // -deadbeef   00 00 00 05 ff 21 52 41 11     reject (negative)
+
+        let zero: &[u8] = &[0x00, 0x00, 0x00, 0x00];
+        let mut reader = zero;
+        assert!(read_ssh_mpint(&mut reader).unwrap().is_empty());
+
+        let big_positive: &[u8] = &[
+            0x00, 0x00, 0x00, 0x08, 0x09, 0xa3, 0x78, 0xf9, 0xb2, 0xe3, 0x32, 0xa7,
+        ];
+        let mut reader = big_positive;
+        assert_eq!(
+            read_ssh_mpint(&mut reader).unwrap(),
+            &[0x09, 0xa3, 0x78, 0xf9, 0xb2, 0xe3, 0x32, 0xa7]
+        );
+
+        let positive_msb_set: &[u8] = &[0x00, 0x00, 0x00, 0x02, 0x00, 0x80];
+        let mut reader = positive_msb_set;
+        assert_eq!(read_ssh_mpint(&mut reader).unwrap(), &[0x80]);
+
+        let negative_small: &[u8] = &[0x00, 0x00, 0x00, 0x02, 0xed, 0xcc];
+        let mut reader = negative_small;
+        assert!(matches!(
+            read_ssh_mpint(&mut reader).unwrap_err(),
+            VerifyError::Parse(_)
+        ));
+
+        let negative_large: &[u8] = &[0x00, 0x00, 0x00, 0x05, 0xff, 0x21, 0x52, 0x41, 0x11];
+        let mut reader = negative_large;
+        assert!(matches!(
+            read_ssh_mpint(&mut reader).unwrap_err(),
+            VerifyError::Parse(_)
+        ));
+    }
+
+    #[test]
     fn test_read_ssh_mpint_rejects_negative_encoding() {
         // [0xFF] is RFC-canonical for -1 in two's complement. Without this check,
         // it would be reinterpreted as unsigned 255 — the same scalar that the
