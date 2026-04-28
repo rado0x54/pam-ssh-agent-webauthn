@@ -14,15 +14,20 @@
 //!
 //! Sequence:
 //!   1. Reject non-absolute path.
-//!   2. Reject path under known user-writable roots (`/home`, `/tmp`, ...).
+//!   2. Reject configured path under known user-writable roots (`/home`,
+//!      `/tmp`, ...) — cheap pre-check.
 //!   3. `open(path, O_RDONLY|O_NOFOLLOW|O_NONBLOCK)` — refuses leaf symlinks
-//!      and prevents blocking on FIFOs.
+//!      and prevents blocking on FIFOs. Intermediate symlinks ARE still
+//!      followed; the canonical-path recheck below catches those.
 //!   4. `fstat` on the open fd — defeats TOCTOU between the path lookup and
 //!      the stat. Require regular file, expected uid, no group/world write.
-//!   5. (Strict modes) Canonicalize the path, re-check against
-//!      `forbidden_roots` to catch symlinks pointing into user-writable roots,
-//!      then walk every ancestor up to `/` requiring same uid + mode rules.
-//!   6. Read content.
+//!   5. Canonicalize and re-check against `forbidden_roots` (unconditional —
+//!      independent of `strict_modes`, since this is a location check, not a
+//!      mode/ownership check). Catches intermediate symlinks like
+//!      `/etc/security -> /private/tmp/...`.
+//!   6. (Strict modes) Walk every ancestor of the canonical path up to `/`
+//!      requiring same uid + mode rules as the leaf.
+//!   7. Read content.
 
 use std::fs::OpenOptions;
 use std::io::{self, Read};
@@ -158,16 +163,21 @@ pub fn open_secure(path: &Path, opts: &Opts) -> Result<String, OpenError> {
         });
     }
 
+    // The canonical-path recheck is location-based, orthogonal to the
+    // mode/ownership ancestor walk gated by strict_modes. It runs
+    // unconditionally so an intermediate-symlink config like
+    // `file=/etc/security/keys` where `/etc/security -> /private/tmp/...`
+    // can't slip past with strict_modes=no. (O_NOFOLLOW only protects the
+    // leaf, so intermediate symlinks are followed at open time.)
+    let canonical = std::fs::canonicalize(path)?;
+    if let Some(root) = matched_forbidden_root(&canonical, opts.forbidden_roots) {
+        return Err(OpenError::UnderUserWritableRoot {
+            path: canonical,
+            root,
+        });
+    }
+
     if opts.strict_modes {
-        let canonical = std::fs::canonicalize(path)?;
-
-        if let Some(root) = matched_forbidden_root(&canonical, opts.forbidden_roots) {
-            return Err(OpenError::UnderUserWritableRoot {
-                path: canonical,
-                root,
-            });
-        }
-
         // Walk ancestors, skipping the leaf which fstat already covered.
         for ancestor in canonical.ancestors().skip(1) {
             let m = std::fs::symlink_metadata(ancestor)?;
@@ -352,6 +362,47 @@ mod tests {
         match err {
             OpenError::UnderUserWritableRoot { root, .. } => assert_eq!(root, "/home/"),
             other => panic!("got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn forbidden_root_recheck_runs_even_with_strict_modes_off() {
+        // Regression: the post-canonicalize forbidden-root recheck must fire
+        // independent of strict_modes. Otherwise an intermediate-symlink
+        // config (e.g. `/etc/security -> /private/tmp/...`) slips past with
+        // strict_modes=no.
+        let dir = scratch_dir("symlink-into-forbidden");
+        let real = dir.join("real");
+        fs::create_dir_all(&real).unwrap();
+        let f = real.join("keys");
+        write_file(&f, "k\n", 0o600);
+        let link = dir.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        // Pretend the canonical target's parent is a forbidden root.
+        // We can't actually make a symlink chain into /tmp here without
+        // owning a root-mode file in /tmp, so we steer the forbidden-roots
+        // list at our scratch tree to exercise the same code path.
+        let real_prefix: &'static str = Box::leak(
+            format!("{}/", real.display()).into_boxed_str(),
+        );
+        let forbidden: &'static [&'static str] = Box::leak(Box::new([real_prefix]));
+
+        let opts = Opts {
+            strict_modes: false,
+            forbidden_roots: forbidden,
+            ..test_opts()
+        };
+        // Configured path goes through the symlink, so the pre-open string
+        // check doesn't match `<scratch>/real/`. Canonical does.
+        let configured = link.join("keys");
+        let err = open_secure(&configured, &opts).unwrap_err();
+        match err {
+            OpenError::UnderUserWritableRoot { path, root } => {
+                assert_eq!(root, real_prefix);
+                assert!(path.starts_with(&real), "canonical path was {path:?}");
+            }
+            other => panic!("expected UnderUserWritableRoot, got {other:?}"),
         }
     }
 
