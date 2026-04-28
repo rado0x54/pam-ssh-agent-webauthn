@@ -9,6 +9,12 @@
 //! auth sufficient pam_ssh_agent_webauthn.so file=/etc/security/authorized_keys
 //! ```
 //!
+//! Module arguments:
+//! * `file=PATH` — authorized_keys path (default `/etc/security/authorized_keys`).
+//! * `socket=PATH` — override `$SSH_AUTH_SOCK`.
+//! * `strict_modes=yes|no` — walk ancestor dir chain checking ownership and
+//!   modes; default `yes`. Mirrors OpenSSH `StrictModes`.
+//!
 //! ## How it works
 //!
 //! 1. Reads authorized WebAuthn public keys from the configured file
@@ -22,6 +28,7 @@
 //! 9. Returns PAM_SUCCESS or PAM_AUTH_ERR
 
 pub mod agent;
+pub mod authfile;
 pub mod keys;
 pub mod webauthn;
 
@@ -84,11 +91,13 @@ impl PamHooks for PamSshWebauthn {
 struct Config {
     key_file: String,
     socket_path: Option<String>,
+    strict_modes: bool,
 }
 
 fn parse_args(args: &[&CStr]) -> Result<Config, String> {
     let mut key_file = DEFAULT_KEY_FILE.to_string();
     let mut socket_path = None;
+    let mut strict_modes = true;
 
     for arg in args {
         let s = arg.to_str().map_err(|e| format!("Invalid arg: {e}"))?;
@@ -96,12 +105,19 @@ fn parse_args(args: &[&CStr]) -> Result<Config, String> {
             key_file = path.to_string();
         } else if let Some(path) = s.strip_prefix("socket=") {
             socket_path = Some(path.to_string());
+        } else if let Some(value) = s.strip_prefix("strict_modes=") {
+            strict_modes = match value {
+                "yes" | "true" | "1" => true,
+                "no" | "false" | "0" => false,
+                other => return Err(format!("Invalid strict_modes value: {other}")),
+            };
         }
     }
 
     Ok(Config {
         key_file,
         socket_path,
+        strict_modes,
     })
 }
 
@@ -109,8 +125,15 @@ fn do_authenticate(config: &Config, handle: &mut PamHandle) -> Result<bool, Box<
     let user = handle.get_user(None).unwrap_or_else(|_| "unknown".to_string());
     info!("pam_ssh_agent_webauthn: authenticating user '{user}'");
 
-    // Read authorized keys
-    let authorized_keys = keys::parse_authorized_keys(Path::new(&config.key_file))?;
+    // Read authorized_keys under the OpenSSH-style safety ladder:
+    // refuse non-absolute paths, refuse user-writable roots, open with
+    // O_NOFOLLOW|O_NONBLOCK, fstat for owner/mode, walk ancestor chain.
+    let opts = authfile::Opts {
+        strict_modes: config.strict_modes,
+        ..Default::default()
+    };
+    let content = authfile::open_secure(Path::new(&config.key_file), &opts)?;
+    let authorized_keys = keys::parse_authorized_keys_str(&content);
     if authorized_keys.is_empty() {
         debug!("No WebAuthn keys found in {}", config.key_file);
         return Ok(false);

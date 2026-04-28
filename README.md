@@ -116,6 +116,19 @@ To override the agent socket path (instead of `$SSH_AUTH_SOCK`):
 auth sufficient pam_ssh_agent_webauthn.so socket=/path/to/agent.sock
 ```
 
+### Authorized-keys file protection
+
+`authorized_keys` is the trust root: each line binds an EC point and an `application` (RP-ID) string into a credential identity that root pinned at registration time. The module enforces an OpenSSH-style ladder before reading the file:
+
+* Path must be absolute and not under any user-writable root (`/home/`, `/tmp/`, `/var/tmp/`, `/run/user/`, `/Users/`). Per-user files are not supported.
+* File is opened with `O_NOFOLLOW | O_NONBLOCK | O_RDONLY` — leaf symlinks and FIFOs are refused.
+* `fstat` on the open fd requires a regular file owned by root with no group/world write bits set.
+* By default (`strict_modes=yes`) every ancestor directory up to `/` must also be root-owned and not group/world-writable. Disable with `strict_modes=no` for unusual filesystems:
+
+```
+auth sufficient pam_ssh_agent_webauthn.so strict_modes=no
+```
+
 ### 4. Preserve SSH_AUTH_SOCK for sudo
 
 ```bash
