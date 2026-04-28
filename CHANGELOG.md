@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.2.2 (2026-04-28)
+
+- feat: support enforcing User Verification (verify-required) ([#17](https://github.com/rado0x54/pam-ssh-agent-webauthn/pull/17))
+
 ## v0.2.1 (2026-04-28)
 
 - fix(pam): tolerate pam_get_user failure to work around pam-bindings release-build bug ([#15](https://github.com/rado0x54/pam-ssh-agent-webauthn/pull/15))
