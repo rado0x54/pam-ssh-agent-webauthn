@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.2.1 (2026-04-28)
+
+- fix(pam): tolerate pam_get_user failure to work around pam-bindings release-build bug ([#15](https://github.com/rado0x54/pam-ssh-agent-webauthn/pull/15))
+- chore(release): rename .so artifacts to pam_ssh_agent_webauthn-VERSION-ARCH.so so the base name matches the PAM install target ([#13](https://github.com/rado0x54/pam-ssh-agent-webauthn/pull/13))
+- chore(ci): bump JS-based actions to Node 24 majors (checkout v6, upload-artifact v7, download-artifact v8) ([#12](https://github.com/rado0x54/pam-ssh-agent-webauthn/pull/12))
+
 ## v0.2.0 (2026-04-28)
 
 - feat(webauthn): reject non-canonical ECDSA signature wire encoding ([#11](https://github.com/rado0x54/pam-ssh-agent-webauthn/pull/11))
