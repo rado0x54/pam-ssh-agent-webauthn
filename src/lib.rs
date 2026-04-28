@@ -111,7 +111,17 @@ fn do_authenticate(config: &Config, handle: &mut PamHandle) -> Result<bool, Box<
         config.key_file
     );
 
-    // Get SSH_AUTH_SOCK from config override or environment
+    // Get SSH_AUTH_SOCK from config override or environment.
+    //
+    // Security note: this path is read from the unprivileged caller's
+    // environment without ownership/symlink/socket-type validation. That is
+    // intentional and matches OpenSSH's own behavior. The agent is only a
+    // signing oracle — it can produce signatures, but only with private keys
+    // it actually holds. Authorization is gated by the EC point + application
+    // pinned in `authorized_keys` (see `keys.rs`), so an attacker pointing
+    // this at a hostile agent cannot forge auth without already controlling a
+    // key listed in the (root-owned) authorized_keys file. The trust root is
+    // that file's integrity, not this socket path.
     let socket_path = match &config.socket_path {
         Some(path) => path.clone(),
         None => std::env::var("SSH_AUTH_SOCK")
