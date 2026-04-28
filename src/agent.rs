@@ -21,6 +21,14 @@ const WEBAUTHN_SK_ALGO: &[u8] = b"webauthn-sk-ecdsa-sha2-nistp256@openssh.com";
 /// response with len=0xFFFFFFFF from causing a huge allocation.
 const MAX_STRING_LEN: usize = 64 * 1024;
 
+/// Max total agent message length (256 KiB), matching OpenSSH's `AGENT_MAX_LEN`
+/// (`ssh-agent.c`) and `MAX_AGENT_REPLY_LEN` (`authfd.c`). Bounds the worst-case
+/// allocation a hostile or buggy agent can force by sending a u32 length prefix
+/// up to ~4 GiB. 256 KiB comfortably fits any realistic reply we handle: an
+/// `IDENTITIES_ANSWER` of ~800 WebAuthn SK identities or a `SIGN_RESPONSE`
+/// (typically well under 4 KiB).
+const MAX_MSG_LEN: usize = 256 * 1024;
+
 /// Timeout for agent socket operations. A hung agent must not block sudo/login
 /// indefinitely. The sign request may require user interaction (passkey tap),
 /// so we use a generous timeout.
@@ -185,14 +193,14 @@ fn write_msg(stream: &mut UnixStream, msg: &[u8]) -> io::Result<()> {
     stream.flush()
 }
 
-fn read_msg(stream: &mut UnixStream) -> io::Result<Vec<u8>> {
+fn read_msg<R: Read>(stream: &mut R) -> io::Result<Vec<u8>> {
     let mut len_buf = [0u8; 4];
     stream.read_exact(&mut len_buf)?;
     let resp_len = u32::from_be_bytes(len_buf) as usize;
-    if resp_len > 1024 * 1024 {
+    if resp_len > MAX_MSG_LEN {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "Response too large",
+            format!("Agent message length {resp_len} exceeds maximum {MAX_MSG_LEN}"),
         ));
     }
     let mut response = vec![0u8; resp_len];
@@ -264,5 +272,26 @@ mod tests {
         let result = read_ssh_bytes(&mut reader).unwrap();
         assert_eq!(result, b"hello");
         assert!(reader.is_empty());
+    }
+
+    #[test]
+    fn test_read_msg_rejects_oversized_length_prefix() {
+        let len = (MAX_MSG_LEN + 1) as u32;
+        let framed = len.to_be_bytes();
+        let mut reader: &[u8] = &framed;
+        let err = read_msg(&mut reader).expect_err("oversized length must be rejected");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn test_read_msg_accepts_max_length_prefix() {
+        let len = MAX_MSG_LEN as u32;
+        let mut framed = Vec::with_capacity(4 + MAX_MSG_LEN);
+        framed.extend_from_slice(&len.to_be_bytes());
+        framed.resize(4 + MAX_MSG_LEN, 0xAB);
+        let mut reader: &[u8] = &framed;
+        let body = read_msg(&mut reader).expect("max-sized message must be accepted");
+        assert_eq!(body.len(), MAX_MSG_LEN);
+        assert!(body.iter().all(|&b| b == 0xAB));
     }
 }
