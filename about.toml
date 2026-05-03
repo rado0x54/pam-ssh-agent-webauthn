@@ -6,6 +6,13 @@
 # Listed in priority order: when a crate is dual-licensed, the first match wins.
 # We prefer MIT to keep attribution short, fall back to Apache-2.0 / BSD-3-Clause
 # / Unlicense for crates that don't offer MIT.
+#
+# Intentionally minimal: this list is not a "permissive licenses we'd accept in
+# theory" catalog. Each entry has been reviewed for its specific obligations,
+# and `cargo about generate --fail` (run on every PR + release) blocks any
+# crate that drifts in under a license not on this list. New entries should be
+# added deliberately, not pre-emptively — pre-approving licenses we don't
+# currently consume defeats the failure signal we just paid to install.
 accepted = [
     "MIT",
     "Apache-2.0",
