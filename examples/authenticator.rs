@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 use std::env;
 use std::path::Path;
 

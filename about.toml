@@ -1,0 +1,33 @@
+# cargo-about config for generating THIRD_PARTY_LICENSES.
+#
+# Run `cargo about generate -c about.toml about.hbs > THIRD_PARTY_LICENSES`
+# to produce the bundled attribution shipped with each release.
+
+# Listed in priority order: when a crate is dual-licensed, the first match wins.
+# We prefer MIT to keep attribution short, fall back to Apache-2.0 / BSD-3-Clause
+# / Unlicense for crates that don't offer MIT.
+#
+# Intentionally minimal: this list is not a "permissive licenses we'd accept in
+# theory" catalog. Each entry has been reviewed for its specific obligations,
+# and `cargo about generate --fail` (run on every PR + release) blocks any
+# crate that drifts in under a license not on this list. New entries should be
+# added deliberately, not pre-emptively — pre-approving licenses we don't
+# currently consume defeats the failure signal we just paid to install.
+accepted = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-3-Clause",
+    "Unlicense",
+]
+
+# The .so artifacts shipped on each release are built for these triples; only
+# crates pulled in for at least one of them need attribution.
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+]
+
+# Build- and dev-only crates do not end up in the .so binary, so they don't need
+# their licenses bundled with binary distributions.
+ignore-build-dependencies = true
+ignore-dev-dependencies = true

@@ -258,13 +258,31 @@ jobs:
             sha256sum "$f" > "${f}.sha256"
           done
 
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: third-party-licenses
+
+      - name: Install cargo-about
+        run: cargo install cargo-about --locked --features cli
+
+      - name: Generate THIRD_PARTY_LICENSES
+        run: |
+          set -euo pipefail
+          cargo about generate --fail -c about.toml -o THIRD_PARTY_LICENSES about.hbs
+          sha256sum THIRD_PARTY_LICENSES > THIRD_PARTY_LICENSES.sha256
+
       - name: Package source
         run: |
           set -euo pipefail
           VERSION="${{ needs.prepare.outputs.version }}"
           ARCHIVE="pam-ssh-agent-webauthn_${VERSION}"
           mkdir -p "${ARCHIVE}"
-          cp -r Cargo.toml Cargo.lock LICENSE README.md CHANGELOG.md src examples tests "${ARCHIVE}/"
+          cp -r Cargo.toml Cargo.lock LICENSE THIRD_PARTY_LICENSES README.md CHANGELOG.md \
+                about.toml about.hbs src examples tests scripts "${ARCHIVE}/"
           zip -r "${ARCHIVE}.zip" "${ARCHIVE}"
           sha256sum "${ARCHIVE}.zip" > "${ARCHIVE}.zip.sha256"
           tar czf "${ARCHIVE}.tar.gz" "${ARCHIVE}"
@@ -297,6 +315,10 @@ jobs:
             echo ""
             echo "These are dynamically linked against \`libpam\` and \`libc\` (glibc 2.35+). Built on Ubuntu 22.04."
             echo ""
+            echo "## Third-party attribution"
+            echo ""
+            echo "\`THIRD_PARTY_LICENSES\` bundles the license texts of every crate statically linked into the \`.so\` artifacts above. Distributors of the prebuilt binaries should ship this file alongside them to satisfy the MIT/BSD/Apache-2.0 attribution requirements of the transitive dependencies."
+            echo ""
             echo "## Source distribution"
             echo ""
             echo "For other targets, or if you need the \`native-crypto\` (OpenSSL/FIPS) feature:"
@@ -326,6 +348,8 @@ jobs:
             binaries/pam_ssh_agent_webauthn-${VERSION}-amd64.so.sha256 \
             binaries/pam_ssh_agent_webauthn-${VERSION}-arm64.so \
             binaries/pam_ssh_agent_webauthn-${VERSION}-arm64.so.sha256 \
+            THIRD_PARTY_LICENSES \
+            THIRD_PARTY_LICENSES.sha256 \
             pam-ssh-agent-webauthn_${VERSION}.zip \
             pam-ssh-agent-webauthn_${VERSION}.zip.sha256 \
             pam-ssh-agent-webauthn_${VERSION}.tar.gz \

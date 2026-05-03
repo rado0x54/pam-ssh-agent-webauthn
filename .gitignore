@@ -2,3 +2,5 @@
 .idea/
 .DS_Store
 .claude/settings.local.json
+# Generated at release time by `cargo about generate`
+/THIRD_PARTY_LICENSES

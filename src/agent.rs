@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 //! SSH agent protocol implementation for WebAuthn SK key operations.
 //!
 //! Communicates directly with the SSH agent via Unix socket, implementing only

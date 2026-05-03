@@ -29,8 +29,21 @@ jobs:
       - name: Install PAM headers
         run: sudo apt-get install -y libpam0g-dev
 
+      - name: Check SPDX headers
+        run: ./scripts/check-spdx.sh
+
       - name: Format
         run: cargo fmt --all -- --check
+
+      # Catches license drift at PR time instead of release time: a routine
+      # cargo update that pulls in a crate under a license outside about.toml's
+      # `accepted` list will fail this step. Re-uses the rust-cache `~/.cargo/bin`
+      # entry — only pays the build cost on cache miss.
+      - name: Install cargo-about
+        run: cargo install cargo-about --locked --features cli
+
+      - name: Check third-party license bundle
+        run: cargo about generate --fail -c about.toml -o /tmp/THIRD_PARTY_LICENSES about.hbs
 
       - name: Clippy
         run: cargo clippy -- -D warnings
