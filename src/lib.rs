@@ -216,7 +216,9 @@ fn parse_args(args: &[&CStr]) -> Result<Config, String> {
                 .parse()
                 .map_err(|_| format!("Invalid max_attempts value: {value}"))?;
             if n == 0 {
-                return Err(format!("Invalid max_attempts value: {value} (must be >= 1)"));
+                return Err(format!(
+                    "Invalid max_attempts value: {value} (must be >= 1)"
+                ));
             }
             max_attempts = n;
         } else if let Some(value) = s.strip_prefix("verify_required=") {
@@ -283,8 +285,8 @@ fn do_authenticate(config: &Config, handle: &mut PamHandle) -> Result<(), AuthEr
         strict_modes: config.strict_modes,
         ..Default::default()
     };
-    let content = authfile::open_secure(Path::new(&config.key_file), &opts)
-        .map_err(classify_open_err)?;
+    let content =
+        authfile::open_secure(Path::new(&config.key_file), &opts).map_err(classify_open_err)?;
     let authorized_keys = keys::parse_authorized_keys_str(&content);
     if authorized_keys.is_empty() {
         // The file exists, passed all safety checks, but contains no WebAuthn
@@ -314,9 +316,8 @@ fn do_authenticate(config: &Config, handle: &mut PamHandle) -> Result<(), AuthEr
     // that file's integrity, not this socket path.
     let socket_path = match &config.socket_path {
         Some(path) => path.clone(),
-        None => std::env::var("SSH_AUTH_SOCK").map_err(|_| {
-            AuthError::InfoUnavailable("SSH_AUTH_SOCK not set".into())
-        })?,
+        None => std::env::var("SSH_AUTH_SOCK")
+            .map_err(|_| AuthError::InfoUnavailable("SSH_AUTH_SOCK not set".into()))?,
     };
     let socket = Path::new(&socket_path);
 
@@ -458,9 +459,7 @@ fn iter_attempts(
                 ));
             }
             Err(TryAuthOutcome::Random(msg)) => {
-                return Err(AuthError::Service(format!(
-                    "challenge generation: {msg}"
-                )));
+                return Err(AuthError::Service(format!("challenge generation: {msg}")));
             }
         }
     }
@@ -475,8 +474,7 @@ fn try_authenticate(
 ) -> Result<(), TryAuthOutcome> {
     // Generate random challenge
     let mut challenge = [0u8; CHALLENGE_SIZE];
-    getrandom::fill(&mut challenge)
-        .map_err(|e| TryAuthOutcome::Random(e.to_string()))?;
+    getrandom::fill(&mut challenge).map_err(|e| TryAuthOutcome::Random(e.to_string()))?;
 
     // Sign via agent
     let raw_sig = match agent::sign_raw(socket, key_blob, &challenge) {
@@ -591,7 +589,12 @@ pub fn authenticate_with_options(
     // ever promoted out of `#[doc(hidden)]` to a supported API, switch to
     // `iter_attempts` so embedders get the same observability.
     for (agent_id, auth_key) in matched.iter().take(max_attempts) {
-        match try_authenticate(socket_path, auth_key, &agent_id.key_blob, module_uv_required) {
+        match try_authenticate(
+            socket_path,
+            auth_key,
+            &agent_id.key_blob,
+            module_uv_required,
+        ) {
             Ok(()) => return Ok(true),
             Err(TryAuthOutcome::Transport(e)) => return Err(Box::new(e)),
             Err(TryAuthOutcome::Random(msg)) => return Err(msg.into()),
@@ -689,7 +692,12 @@ mod tests {
     fn parse_args_rejects_invalid_max_attempts() {
         // Zero would silently turn the module into an unconditional fail —
         // refuse it. Negatives and non-numerics are typos and equally bad.
-        for bad in ["max_attempts=0", "max_attempts=-1", "max_attempts=abc", "max_attempts="] {
+        for bad in [
+            "max_attempts=0",
+            "max_attempts=-1",
+            "max_attempts=abc",
+            "max_attempts=",
+        ] {
             let err = parse(&[bad]).expect_err(&format!("expected error for {bad}"));
             assert!(err.contains("max_attempts"), "wrong error for {bad}: {err}");
         }
@@ -698,9 +706,17 @@ mod tests {
     #[test]
     fn parse_args_rejects_unknown_arg() {
         // Common typos must be rejected, not silently dropped.
-        for bad in ["strictmodes=no", "strict-modes=no", "strict_mode=no", "garbage"] {
+        for bad in [
+            "strictmodes=no",
+            "strict-modes=no",
+            "strict_mode=no",
+            "garbage",
+        ] {
             let err = parse(&[bad]).expect_err(&format!("expected error for {bad}"));
-            assert!(err.contains("Unknown argument"), "wrong error for {bad}: {err}");
+            assert!(
+                err.contains("Unknown argument"),
+                "wrong error for {bad}: {err}"
+            );
         }
     }
 
@@ -729,10 +745,7 @@ mod tests {
     #[test]
     fn classify_io_err_routes_invalid_data_to_service() {
         let e = io::Error::new(io::ErrorKind::InvalidData, "bad");
-        assert!(matches!(
-            classify_io_err(e, "ctx"),
-            AuthError::Service(_)
-        ));
+        assert!(matches!(classify_io_err(e, "ctx"), AuthError::Service(_)));
     }
 
     #[test]
