@@ -1,5 +1,10 @@
 # Changelog
 
+## v1.0.0 (2026-05-03)
+
+- chore: bundle THIRD_PARTY_LICENSES with releases and add SPDX file headers ([#19](https://github.com/rado0x54/pam-ssh-agent-webauthn/pull/19))
+- chore(fmt): apply rustfmt and add cargo fmt --check to CI ([#20](https://github.com/rado0x54/pam-ssh-agent-webauthn/pull/20))
+
 ## v0.2.2 (2026-04-28)
 
 - feat: support enforcing User Verification (verify-required) ([#17](https://github.com/rado0x54/pam-ssh-agent-webauthn/pull/17))
