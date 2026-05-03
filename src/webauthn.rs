@@ -228,12 +228,9 @@ fn validate_client_data(
         .map_err(|e| VerifyError::Parse(format!("Invalid clientDataJSON: {e}")))?;
 
     // Validate type field (WebAuthn spec step 11)
-    let type_field = parsed
-        .get("type")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| {
-            VerifyError::InvalidType("Missing 'type' field in clientDataJSON".to_string())
-        })?;
+    let type_field = parsed.get("type").and_then(|v| v.as_str()).ok_or_else(|| {
+        VerifyError::InvalidType("Missing 'type' field in clientDataJSON".to_string())
+    })?;
     if type_field != "webauthn.get" {
         return Err(VerifyError::InvalidType(format!(
             "Expected type 'webauthn.get', got '{type_field}'"
@@ -527,9 +524,8 @@ mod tests {
         let challenge = b"test-challenge-data-here!1234567";
         let encoded = URL_SAFE_NO_PAD.encode(challenge);
         let origin = "https://example.com";
-        let client_data = format!(
-            r#"{{"type":"webauthn.get","challenge":"{encoded}","origin":"{origin}"}}"#
-        );
+        let client_data =
+            format!(r#"{{"type":"webauthn.get","challenge":"{encoded}","origin":"{origin}"}}"#);
         assert!(validate_client_data(&client_data, challenge, origin).is_ok());
         assert!(validate_client_data(&client_data, b"wrong", origin).is_err());
 
@@ -544,16 +540,13 @@ mod tests {
         let origin = "https://example.com";
 
         // webauthn.create should be rejected
-        let client_data = format!(
-            r#"{{"type":"webauthn.create","challenge":"{encoded}","origin":"{origin}"}}"#
-        );
+        let client_data =
+            format!(r#"{{"type":"webauthn.create","challenge":"{encoded}","origin":"{origin}"}}"#);
         let err = validate_client_data(&client_data, challenge, origin).unwrap_err();
         assert!(matches!(err, VerifyError::InvalidType(_)));
 
         // Missing type field
-        let client_data = format!(
-            r#"{{"challenge":"{encoded}","origin":"{origin}"}}"#
-        );
+        let client_data = format!(r#"{{"challenge":"{encoded}","origin":"{origin}"}}"#);
         let err = validate_client_data(&client_data, challenge, origin).unwrap_err();
         assert!(matches!(err, VerifyError::InvalidType(_)));
     }

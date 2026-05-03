@@ -83,25 +83,43 @@ impl Default for Opts {
 #[derive(Debug)]
 pub enum OpenError {
     NotAbsolute(PathBuf),
-    UnderUserWritableRoot { path: PathBuf, root: &'static str },
+    UnderUserWritableRoot {
+        path: PathBuf,
+        root: &'static str,
+    },
     NotRegularFile(PathBuf),
-    BadOwner { path: PathBuf, actual: u32, expected: u32 },
-    BadMode { path: PathBuf, mode: u32 },
+    BadOwner {
+        path: PathBuf,
+        actual: u32,
+        expected: u32,
+    },
+    BadMode {
+        path: PathBuf,
+        mode: u32,
+    },
     Io(io::Error),
 }
 
 impl std::fmt::Display for OpenError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::NotAbsolute(p) => write!(f, "authorized_keys path is not absolute: {}", p.display()),
+            Self::NotAbsolute(p) => {
+                write!(f, "authorized_keys path is not absolute: {}", p.display())
+            }
             Self::UnderUserWritableRoot { path, root } => write!(
                 f,
                 "authorized_keys path {} is under user-writable root {root} \
                  (per-user mode is not supported)",
                 path.display()
             ),
-            Self::NotRegularFile(p) => write!(f, "authorized_keys is not a regular file: {}", p.display()),
-            Self::BadOwner { path, actual, expected } => write!(
+            Self::NotRegularFile(p) => {
+                write!(f, "authorized_keys is not a regular file: {}", p.display())
+            }
+            Self::BadOwner {
+                path,
+                actual,
+                expected,
+            } => write!(
                 f,
                 "authorized_keys {} owner uid={actual} (expected uid={expected})",
                 path.display()
@@ -278,7 +296,10 @@ mod tests {
         write_file(&f, "k\n", 0o620);
 
         let err = open_secure(&f, &test_opts()).unwrap_err();
-        assert!(matches!(err, OpenError::BadMode { mode: 0o620, .. }), "got {err:?}");
+        assert!(
+            matches!(err, OpenError::BadMode { mode: 0o620, .. }),
+            "got {err:?}"
+        );
     }
 
     #[test]
@@ -288,7 +309,10 @@ mod tests {
         write_file(&f, "k\n", 0o602);
 
         let err = open_secure(&f, &test_opts()).unwrap_err();
-        assert!(matches!(err, OpenError::BadMode { mode: 0o602, .. }), "got {err:?}");
+        assert!(
+            matches!(err, OpenError::BadMode { mode: 0o602, .. }),
+            "got {err:?}"
+        );
     }
 
     #[test]
@@ -383,9 +407,7 @@ mod tests {
         // We can't actually make a symlink chain into /tmp here without
         // owning a root-mode file in /tmp, so we steer the forbidden-roots
         // list at our scratch tree to exercise the same code path.
-        let real_prefix: &'static str = Box::leak(
-            format!("{}/", real.display()).into_boxed_str(),
-        );
+        let real_prefix: &'static str = Box::leak(format!("{}/", real.display()).into_boxed_str());
         let forbidden: &'static [&'static str] = Box::leak(Box::new([real_prefix]));
 
         let opts = Opts {
@@ -445,6 +467,9 @@ mod tests {
             ..test_opts()
         };
         let err = open_secure(&f, &opts).unwrap_err();
-        assert!(matches!(err, OpenError::BadMode { .. } | OpenError::BadOwner { .. }), "got {err:?}");
+        assert!(
+            matches!(err, OpenError::BadMode { .. } | OpenError::BadOwner { .. }),
+            "got {err:?}"
+        );
     }
 }
