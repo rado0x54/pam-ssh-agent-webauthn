@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 //! Integration test: full WebAuthn roundtrip with a mock SSH agent.
 //!
 //! Creates a mock agent that listens on a Unix socket, serves a WebAuthn SK key,

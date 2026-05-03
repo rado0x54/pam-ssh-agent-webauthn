@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 //! Secure open of the authorized_keys file.
 //!
 //! This PAM module's trust root is the authorized_keys file: each line binds an

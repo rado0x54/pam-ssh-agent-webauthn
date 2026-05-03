@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 //! WebAuthn SK ECDSA signature verification.
 //!
 //! Parses the extended SSH signature wire format (with origin, clientDataJSON,

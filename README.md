@@ -278,3 +278,14 @@ SSH_AUTH_SOCK=/path/to/agent.sock cargo run --example list_keys
 ```
 
 **Silent failures** — Enable debug logging to see detailed matching and verification steps. The module logs to syslog facility `AUTH`.
+
+## License
+
+This crate is licensed under the [MIT License](LICENSE). Every `.rs` source file carries an `SPDX-License-Identifier: MIT` header; CI fails if a new file lands without one.
+
+Each release on GitHub ships a `THIRD_PARTY_LICENSES` asset alongside the `.so` artifacts. It bundles the license texts of every crate statically linked into the prebuilt binaries (generated from `Cargo.lock` by [`cargo-about`](https://github.com/EmbarkStudios/cargo-about) at release time). Distributors of the prebuilt `.so` files should redistribute `THIRD_PARTY_LICENSES` alongside them to satisfy the attribution requirements of MIT/BSD/Apache-2.0 transitive dependencies. To regenerate it locally:
+
+```bash
+cargo install cargo-about --locked --features cli
+cargo about generate --fail -c about.toml -o THIRD_PARTY_LICENSES about.hbs
+```

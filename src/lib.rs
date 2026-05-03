@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 //! pam_ssh_agent_webauthn — PAM module for WebAuthn passkey-protected sudo.
 //!
 //! Authenticates via a forwarded SSH agent that holds WebAuthn SK ECDSA keys.

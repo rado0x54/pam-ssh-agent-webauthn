@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 //! Parse WebAuthn SK public keys from authorized_keys files.
 //!
 //! Only handles `webauthn-sk-ecdsa-sha2-nistp256@openssh.com` keys.

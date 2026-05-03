@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 use base64::prelude::BASE64_STANDARD;
 use base64::Engine;
 use std::env;

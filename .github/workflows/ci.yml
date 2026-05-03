@@ -29,6 +29,9 @@ jobs:
       - name: Install PAM headers
         run: sudo apt-get install -y libpam0g-dev
 
+      - name: Check SPDX headers
+        run: ./scripts/check-spdx.sh
+
       - name: Format
         run: cargo fmt --all -- --check
 
